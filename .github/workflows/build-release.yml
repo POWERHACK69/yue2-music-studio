@@ -38,6 +38,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          architecture: 'x64'  # force 64-bit interpreter so PyInstaller bundles x64
           cache: 'pip'
 
       - name: Install Python dependencies
@@ -89,6 +90,40 @@ jobs:
           if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
           cp "$CLI_BIN" ../bin/
           ls -la ../bin
+
+      # ----------------- VERIFY 64-BIT TARGET ARCH -----------------
+      - name: Verify 64-bit binary (Windows x64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Read the PE header Machine field: 0x8664 = AMD64 (x86_64)
+          $bytes = [System.IO.File]::ReadAllBytes("bin\audiocpp_cli.exe")
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          "PE Machine: 0x$($machine.ToString('X4'))"
+          if ($machine -ne 0x8664) { throw "audiocpp_cli.exe is NOT 64-bit x86 (Machine=0x$($machine.ToString('X4')))" }
+          python -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
+          "Windows x86_64 check passed."
+
+      - name: Verify 64-bit binary (Linux x86_64)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -m | grep -q "x86_64"
+          file bin/audiocpp_cli | grep -q "x86-64"
+          python3 -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
+          echo "Linux x86_64 check passed."
+
+      - name: Verify 64-bit binary (macOS arm64)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -m | grep -q "arm64"
+          file bin/audiocpp_cli | grep -q "arm64"
+          python3 -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
+          echo "macOS arm64 check passed."
 
       # ----------------- BUNDLE WITH PYINSTALLER -----------------
       - name: Package standalone app (Windows)
