@@ -60,13 +60,23 @@ jobs:
           Copy-Item $cli.FullName ..\bin\audiocpp_cli.exe
           Get-ChildItem ..\bin
 
-      - name: Build audio.cpp on Linux (CPU)
+      - name: Build audio.cpp on Linux (CPU, x86_64)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-13 g++-13 cmake ninja-build libsndfile1-dev
+          # audio.cpp requires GCC 13+, but vanilla Ubuntu 22.04 repos only go up
+          # to GCC 12. Use the preinstalled compiler if present, else pull GCC 13
+          # from the Ubuntu toolchain PPA (keeps the older 22.04 glibc for wider
+          # compatibility of the resulting binaries).
+          if ! command -v gcc-13 >/dev/null 2>&1; then
+            sudo apt-get install -y -qq software-properties-common
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gcc-13 g++-13
+          fi
+          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           cd audio-cpp
           export CC=gcc-13 CXX=g++-13
@@ -147,6 +157,45 @@ jobs:
             app/main.py
           tar -czf ${{ matrix.artifact_name }}.tar.gz -C dist Yue2Studio
 
+      - name: Build AppImage (Linux x86_64)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Assemble AppDir from the PyInstaller onedir output (kept intact so
+          # the bootloader finds its bundled libraries).
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          cp -a dist/Yue2Studio/. AppDir/usr/bin/
+          cp packaging/Yue2Studio.desktop AppDir/
+          cp packaging/Yue2Studio.desktop AppDir/usr/share/applications/
+          cp app/icon.png AppDir/Yue2Studio.png
+          cp app/icon.png AppDir/.DirIcon
+          cp app/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/Yue2Studio.png
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/Yue2Studio" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun AppDir/usr/bin/Yue2Studio
+          # appimagetool itself is an AppImage; --appimage-extract-and-run avoids
+          # needing FUSE on the runner.
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract-and-run AppDir Yue2Studio-Linux-x64.AppImage
+          ls -la Yue2Studio-Linux-x64.AppImage
+
+      - name: Build RPM (Linux x86_64)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Version from tag (v1.2.3 -> 1.2.3); manual runs get 0.0.0.
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then VERSION="0.0.0"; fi
+          echo "RPM version: $VERSION"
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          sed "s/@VERSION@/${VERSION}/" packaging/yue2studio.spec > ~/rpmbuild/SPECS/yue2studio.spec
+          rpmbuild -bb --define "srcdir ${PWD}" ~/rpmbuild/SPECS/yue2studio.spec
+          cp ~/rpmbuild/RPMS/x86_64/yue2studio-*.x86_64.rpm ./Yue2Studio-Linux-x64.rpm
+          ls -la Yue2Studio-Linux-x64.rpm
+
       - name: Package standalone app (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -160,11 +209,29 @@ jobs:
           zip -r ../${{ matrix.artifact_name }}.zip Yue2Studio.app
 
       # ----------------- UPLOAD ARTIFACTS -----------------
-      - name: Upload build artifacts
+      - name: Upload build artifacts (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+      - name: Upload build artifacts (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+      - name: Upload build artifacts (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            Yue2Studio-Linux-x64.AppImage
+            Yue2Studio-Linux-x64.rpm
 
   release:
     name: Publish GitHub Release

@@ -12,7 +12,7 @@ Standalone desktop GUI for **YuE2-3B** song generation powered by the native
 - **Packaging:** PyInstaller in GitHub Actions
   - Windows: `Yue2Studio-Windows-x64.zip` (portable `.exe`)
   - macOS: `Yue2Studio-macOS-arm64.zip` (`.app`, Metal)
-  - Linux: `Yue2Studio-Linux-x64.tar.gz` (portable binary)
+  - Linux: `Yue2Studio-Linux-x64.tar.gz` (portable), `Yue2Studio-Linux-x64.AppImage`, `Yue2Studio-Linux-x64.rpm`
 
 ## Project layout
 
@@ -109,12 +109,21 @@ git push origin v1.0.0
 Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App* → **Run workflow**.
 
 3. Download artifacts from the workflow run (**Artifacts**) or from **Releases**
-   (on tag pushes). Models are **not** bundled — they download on first run
+   (on tag pushes). Linux ships three formats:
+
+   | File | How to use |
+   |------|------------|
+   | `Yue2Studio-Linux-x64.tar.gz` | Portable: `tar -xzf ... && ./Yue2Studio/Yue2Studio` |
+   | `Yue2Studio-Linux-x64.AppImage` | Portable: `chmod +x ...AppImage && ./Yue2Studio-Linux-x64.AppImage` (needs FUSE: `sudo apt install libfuse2` on newer Ubuntu) |
+   | `Yue2Studio-Linux-x64.rpm` | Install: `sudo dnf install ./Yue2Studio-Linux-x64.rpm`, then run `Yue2Studio` |
+
+   Models are **not** bundled — they download on first run
    (~2.6 GB for `q4_0`, ~4.2 GB for `q8_0`, ~7.2 GB for `bf16`).
 
 ### Notes
 
-- Linux CI uses GCC 13 + `libsndfile1-dev`; Windows CI uses the
+- Linux CI builds on Ubuntu 22.04 (older glibc for wider compatibility) with
+  GCC 13 from the Ubuntu toolchain PPA + `libsndfile1-dev`; Windows CI uses the
   `windows-cpu-release` preset; macOS CI (`macos-14`) builds the Metal backend.
 - If `pygame` cannot initialise audio (headless CI), the GUI still runs and logs
   a warning; generated WAVs remain playable from `outputs/`.

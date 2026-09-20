@@ -4,7 +4,11 @@ venv/
 .venv/
 dist/
 build/
-*.spec
+/*.spec
+AppDir/
+appimagetool.AppImage
+*.AppImage
+*.rpm
 bin/audiocpp_cli
 bin/audiocpp_cli.exe
 models/*

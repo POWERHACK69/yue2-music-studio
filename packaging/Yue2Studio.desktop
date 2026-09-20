@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=YuE2 Music Studio
+GenericName=AI Music Studio
+Comment=Offline AI song generation with YuE2-3B (audio.cpp)
+Exec=Yue2Studio
+Icon=Yue2Studio
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+StartupWMClass=Yue2Studio
