@@ -1,9 +1,14 @@
 name: Build & Release Yue2 Studio Standalone App
 
-# All heavy compilation happens here so low-disk-space users never build
-# locally: pick exactly what you need via "Run workflow" inputs, or push a
-# tag (v*) to build every platform. Models are never bundled — they download
-# on first run from inside the app (~2.6GB q4_0 / ~4.2GB q8_0 / ~7.2GB bf16).
+# One artifact per OS, each with every backend compiled in:
+#   Windows: CPU + CUDA + Vulkan | Linux: CPU + CUDA + Vulkan | macOS: CPU + Metal
+# The in-app backend dropdown (auto/cuda/cpu/vulkan/metal) selects at RUNTIME.
+# Upstream audio.cpp CMake allows CUDA+Vulkan together (only CUDA+HIP is
+# forbidden); its helper scripts just package them separately. Here we
+# configure CMake directly to get a single all-backend binary. All heavy
+# compilation happens in CI, so low-disk-space users never build locally.
+# Models are never bundled — they download on first run from inside the app
+# (~2.6GB q4_0 / ~4.2GB q8_0 / ~7.2GB bf16).
 
 on:
   push:
@@ -11,16 +16,12 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      windows_cpu:
-        description: 'Build Windows CPU (portable, AVX2/baseline)'
-        type: boolean
-        default: true
-      windows_cuda:
-        description: 'Build Windows CUDA (includes CPU backend too)'
+      windows:
+        description: 'Build Windows (CPU+CUDA+Vulkan)'
         type: boolean
         default: true
       linux:
-        description: 'Build Linux CPU (portable)'
+        description: 'Build Linux (CPU+CUDA+Vulkan)'
         type: boolean
         default: true
       mac:
@@ -43,13 +44,17 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
+  # Pinned toolchain versions (mirrors upstream audio.cpp release.yml).
+  CUDA_VERSION_WINDOWS: '12.8.1'
+  CUDA_VERSION_LINUX: '12.8.1'
+  VULKAN_VERSION: '1.4.357.0'
 
 jobs:
-  # ================= Windows CPU (portable) =================
-  windows-cpu:
-    name: Windows CPU (portable)
+  # ================= Windows: CPU + CUDA + Vulkan =================
+  windows:
+    name: Windows x64 (CPU+CUDA+Vulkan)
     runs-on: windows-latest
-    if: github.event_name != 'workflow_dispatch' || inputs.windows_cpu
+    if: github.event_name != 'workflow_dispatch' || inputs.windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -67,31 +72,99 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build audio.cpp (CPU, distributable)
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION_WINDOWS }}
+          method: 'local'
+
+      - name: Install Vulkan SDK
         shell: pwsh
         run: |
-          # -CpuArch avx2 (balance) avoids AVX-512/native instructions that crash
-          # with 0xC000001D on CPUs without AVX-512. Use 'baseline' for oldest PCs.
+          curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build audio.cpp (CPU+CUDA+Vulkan, distributable)
+        shell: pwsh
+        run: |
+          # Direct CMake: the helper scripts (build_windows.ps1 presets) force a
+          # single GPU backend, but upstream CMake itself only forbids CUDA+HIP,
+          # so CUDA+Vulkan configure fine together. CUDA arch list is left unset
+          # on purpose → audio.cpp applies its portable multi-arch default
+          # (NOT the local-GPU auto-detect the scripts use).
+          # -CpuArch avx2 (balance) avoids AVX-512-only instructions that crash
+          # with 0xC000001D on CPUs without AVX-512. 'baseline' is slowest but
+          # runs on the oldest PCs (also disables llamafile SGEMM, like the
+          # upstream 'portable' profile).
           $arch = "${{ inputs.cpu_arch }}"
           if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          cd audio-cpp
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cpu-release -CpuArch $arch -ModelSet custom -Models "yue2" -Target audiocpp_cli
-          New-Item -ItemType Directory -Force -Path ..\bin | Out-Null
-          $cli = Get-ChildItem -Recurse -Filter audiocpp_cli.exe | Select-Object -First 1
-          if (-not $cli) { throw "audiocpp_cli.exe not found after build" }
-          Copy-Item $cli.FullName ..\bin\audiocpp_cli.exe
-          # Bundle any backend DLLs produced by the build (ggml-*.dll, etc.)
-          Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName ..\bin\ -Force }
-          # Bundle MSVC + OpenMP runtime DLLs so users need no Build Tools.
-          $redist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
-          if (Test-Path $redist) {
-            $crt = Get-ChildItem "$redist\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            $omp = Get-ChildItem "$redist\*\x64\Microsoft.VC143.OpenMP" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            if ($crt) { Copy-Item "$($crt.FullName)\MSVCP140.dll", "$($crt.FullName)\VCRUNTIME140.dll", "$($crt.FullName)\VCRUNTIME140_1.dll" ..\bin\ -Force -ErrorAction SilentlyContinue }
-            if ($omp) { Copy-Item "$($omp.FullName)\VCOMP140.DLL" ..\bin\ -Force -ErrorAction SilentlyContinue }
+          if ($arch -eq "baseline") {
+            $isa = @("-DGGML_AVX=OFF", "-DGGML_AVX2=OFF", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AVX_VNNI=OFF")
+            $llamafile = "OFF"
+          } else {
+            $isa = @("-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AVX_VNNI=OFF")
+            $llamafile = "ON"
           }
-          Get-ChildItem ..\bin
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          cmake -S audio-cpp -B build/windows-all-release -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_FLAGS=/utf-8 "-DCMAKE_CXX_FLAGS=/utf-8 /EHsc" `
+            -DOpenMP_C_FLAGS=/openmp:experimental -DOpenMP_CXX_FLAGS=/openmp:experimental `
+            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON `
+            -DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_METAL=OFF `
+            -DENGINE_ENABLE_OPENMP=ON -DGGML_OPENMP=ON `
+            -DENGINE_ENABLE_NATIVE_CPU=OFF -DENGINE_ENABLE_LLAMAFILE=$llamafile `
+            @isa `
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
+            -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
+            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+            "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8"
+          if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
+            throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
+          }
+          $jobs = [Math]::Max(2, [Environment]::ProcessorCount)
+          cmake --build build/windows-all-release -j $jobs --target audiocpp_cli
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          $cli = Get-ChildItem -Recurse -Path build/windows-all-release -Filter audiocpp_cli.exe | Select-Object -First 1
+          if (-not $cli) { throw "audiocpp_cli.exe not found after build" }
+          Copy-Item $cli.FullName bin\audiocpp_cli.exe
+          # Any backend DLLs produced by the build (shared-backend layout).
+          Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName bin\ -Force }
+          # CUDA runtime DLLs (always dynamic) from the toolkit.
+          foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
+            if (Test-Path $d) {
+              foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll")) {
+                Copy-Item "$d\$pat" bin\ -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          # MSVC + OpenMP runtime DLLs (vswhere discovery, any VS2022 edition).
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vs) {
+              $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+              if ($redist) {
+                foreach ($sub in 'x64\Microsoft.VC143.CRT', 'x64\Microsoft.VC143.OpenMP') {
+                  $dir = Join-Path $redist.FullName $sub
+                  if (Test-Path $dir) {
+                    Get-ChildItem "$dir\*.dll" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(vcruntime140|msvcp140|vcomp140)' } | Copy-Item -Destination bin\ -Force -ErrorAction SilentlyContinue
+                  }
+                }
+              }
+            }
+          }
+          Get-ChildItem bin
+          # Prove all three backends compiled in (informational: no GPU on runner).
+          .\bin\audiocpp_cli.exe --list-devices
 
       - name: Verify 64-bit binary (Windows x64)
         shell: pwsh
@@ -104,7 +177,7 @@ jobs:
           python -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
           "Windows x86_64 check passed."
 
-      - name: Package standalone app (Windows CPU)
+      - name: Package standalone app (Windows)
         shell: pwsh
         run: |
           $addBin = @()
@@ -113,97 +186,15 @@ jobs:
           pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" @addBin --collect-all customtkinter app/main.py
           Compress-Archive -Path dist/Yue2Studio -DestinationPath Yue2Studio-Windows-x64.zip
 
-      - name: Upload build artifacts (Windows CPU)
+      - name: Upload build artifacts (Windows)
         uses: actions/upload-artifact@v4
         with:
           name: Yue2Studio-Windows-x64
           path: Yue2Studio-Windows-x64.zip
 
-  # ================= Windows CUDA (includes CPU backend) =================
-  windows-cuda:
-    name: Windows CUDA (+CPU fallback)
-    runs-on: windows-latest
-    if: github.event_name != 'workflow_dispatch' || inputs.windows_cuda
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          architecture: 'x64'
-          cache: 'pip'
-
-      - name: Install Python dependencies
-        shell: pwsh
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.21
-        id: cuda-toolkit
-        with:
-          cuda: '13.3.1'
-          method: 'network'
-          use-github-cache: true
-          use-prime: false
-
-      - name: Build audio.cpp (CUDA, distributable)
-        shell: pwsh
-        run: |
-          # -CudaArchitectures default = portable multi-arch list (75/80/86/89/120a/121a
-          # filtered by nvcc), NOT the local-GPU auto-detect. CUDA builds also include
-          # the CPU backend, so one binary serves --backend cuda and --backend cpu.
-          $arch = "${{ inputs.cpu_arch }}"
-          if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          cd audio-cpp
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cuda-release -CpuArch $arch -CudaArchitectures default -ModelSet custom -Models "yue2" -Target audiocpp_cli
-          New-Item -ItemType Directory -Force -Path ..\bin | Out-Null
-          $bindir = (Get-ChildItem -Recurse -Filter audiocpp_cli.exe | Select-Object -First 1).DirectoryName
-          if (-not $bindir) { throw "audiocpp_cli.exe not found after build" }
-          Copy-Item "$bindir\audiocpp_cli.exe" ..\bin\ -Force
-          # Backend + CUDA runtime DLLs (ggml-cuda, cublas, cufft, cudart…).
-          Get-ChildItem -Path $bindir -Filter *.dll | ForEach-Object { Copy-Item $_.FullName ..\bin\ -Force }
-          $cudabin = @()
-          if ($env:CUDA_PATH) { $cudabin += "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin" }
-          $cudabin += "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin", "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"
-          foreach ($pat in @("cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "cudart64_*.dll")) {
-            foreach ($d in $cudabin) {
-              if (Test-Path $d) { Copy-Item "$d\$pat" ..\bin\ -Force -ErrorAction SilentlyContinue }
-            }
-          }
-          $redist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
-          if (Test-Path $redist) {
-            $crt = Get-ChildItem "$redist\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            $omp = Get-ChildItem "$redist\*\x64\Microsoft.VC143.OpenMP" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-            if ($crt) { Copy-Item "$($crt.FullName)\MSVCP140.dll", "$($crt.FullName)\VCRUNTIME140.dll", "$($crt.FullName)\VCRUNTIME140_1.dll" ..\bin\ -Force -ErrorAction SilentlyContinue }
-            if ($omp) { Copy-Item "$($omp.FullName)\VCOMP140.DLL" ..\bin\ -Force -ErrorAction SilentlyContinue }
-          }
-          Get-ChildItem ..\bin
-          # Sanity: CUDA backend DLL must be present.
-          if (-not (Get-ChildItem ..\bin -Filter "*cuda*.dll")) { Write-Warning "No *cuda*.dll in bin/ — CUDA backend may be missing!" }
-
-      - name: Package standalone app (Windows CUDA)
-        shell: pwsh
-        run: |
-          $addBin = @()
-          $addBin += "--add-binary"; $addBin += "bin/audiocpp_cli.exe;bin"
-          Get-ChildItem -Path bin -Filter *.dll | ForEach-Object { $addBin += "--add-binary"; $addBin += "bin/$($_.Name);bin" }
-          pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" @addBin --collect-all customtkinter app/main.py
-          Compress-Archive -Path dist/Yue2Studio -DestinationPath Yue2Studio-Windows-x64-CUDA.zip
-
-      - name: Upload build artifacts (Windows CUDA)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Yue2Studio-Windows-x64-CUDA
-          path: Yue2Studio-Windows-x64-CUDA.zip
-
-  # ================= Linux CPU (portable) =================
+  # ================= Linux: CPU + CUDA + Vulkan =================
   linux:
-    name: Linux CPU (portable)
+    name: Linux x64 (CPU+CUDA+Vulkan)
     runs-on: ubuntu-22.04
     if: github.event_name != 'workflow_dispatch' || inputs.linux
     steps:
@@ -223,31 +214,58 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Build audio.cpp (CPU portable, x86_64)
+      - name: Install build dependencies (CPU/Vulkan side)
         shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
+          # GCC 13 (audio.cpp minimum) + Vulkan SDK pieces mirror upstream's
+          # release.yml (glslc, headers). CUDA toolkit comes via the action below.
           if ! command -v gcc-13 >/dev/null 2>&1; then
             sudo apt-get install -y -qq software-properties-common
             sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
             sudo apt-get update -qq
             sudo apt-get install -y -qq gcc-13 g++-13
           fi
-          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache
+          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache glslc libvulkan-dev spirv-headers
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION_LINUX }}
+          method: 'network'
+
+      - name: Build audio.cpp (CPU+CUDA+Vulkan, portable)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Direct CMake for the same reason as Windows: helper scripts allow
+          # only one GPU backend, upstream CMake allows CUDA+Vulkan together.
+          # --native-cpu OFF equivalent = portable kernels (no -march=native →
+          # no AVX-512-only binary that dies with SIGILL on older CPUs).
+          # CUDA arches unset → audio.cpp's portable multi-arch default.
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          cd audio-cpp
-          export CC=gcc-13 CXX=g++-13
-          # --native-cpu OFF = portable kernels (no -march=native → no AVX-512-only
-          # binary that dies with SIGILL on older CPUs). --ccache speeds rebuilds.
-          ./scripts/build_linux.sh --backend cpu --native-cpu OFF --ccache --model-set custom --models yue2 --target audiocpp_cli
-          mkdir -p ../bin
-          CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
+          export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
+          cmake -S audio-cpp -B build/linux-all-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON \
+            -DENGINE_ENABLE_VULKAN=ON \
+            -DENGINE_ENABLE_NATIVE_CPU=OFF \
+            -DENGINE_ENABLE_LLAMAFILE=ON \
+            -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
+            -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2
+          cmake --build build/linux-all-release --parallel "$(nproc)" --target audiocpp_cli
+          mkdir -p bin
+          CLI_BIN=$(find build/linux-all-release -type f -name audiocpp_cli | head -n 1)
           if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
-          cp "$CLI_BIN" ../bin/
-          # Bundle shared libs the CLI needs that may be missing on target machines.
-          find build -name "*.so*" -type f | head -n 20 || true
-          ls -la ../bin
+          cp "$CLI_BIN" bin/
+          # Any shared backend libs produced by the build.
+          find "$(dirname "$CLI_BIN")" -maxdepth 1 -name "*.so*" -type f -exec cp {} bin/ \; || true
+          ls -la bin
+          # Prove all three backends compiled in (informational: no GPU on runner).
+          ./bin/audiocpp_cli --list-devices || ./bin/audiocpp_cli --help | head -n 40
 
       - name: Verify 64-bit binary (Linux x86_64)
         shell: bash
@@ -262,8 +280,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          BIN_ARGS=(--add-binary "bin/audiocpp_cli:bin")
+          for so in bin/*.so*; do [ -f "$so" ] && BIN_ARGS+=(--add-binary "$so:bin"); done
           pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" \
-            --add-binary "bin/audiocpp_cli:bin" \
+            "${BIN_ARGS[@]}" \
             --collect-all customtkinter \
             app/main.py
           tar -czf Yue2Studio-Linux-x64.tar.gz -C dist Yue2Studio
@@ -373,7 +393,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [windows-cpu, windows-cuda, linux, macos]
+    needs: [windows, linux, macos]
     if: always() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:

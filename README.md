@@ -4,10 +4,10 @@ Standalone desktop GUI for **YuE2-3B** song generation powered by the native
 [audio.cpp](https://github.com/0xShug0/audio.cpp) inference engine (`audiocpp_cli`).
 
 - **GUI front-end:** CustomTkinter (dark mode, no Qt display-server issues)
-- **Inference engine:** bundled `audiocpp_cli` (built with portable CPU kernels)
-  - Windows: **CUDA build** (`Yue2Studio-Windows-x64-CUDA.zip`, includes CPU fallback) and **CPU-only portable build** (`Yue2Studio-Windows-x64.zip`)
-  - macOS Apple Silicon → **Metal**
-  - Linux → **CPU portable**
+- **Inference engine:** bundled `audiocpp_cli` with **all backends compiled into one binary**
+  - Windows (`Yue2Studio-Windows-x64.zip`): **CPU + CUDA + Vulkan** — leave the backend on `auto` or pick explicitly
+  - Linux (`Yue2Studio-Linux-x64.*`): **CPU + CUDA + Vulkan**
+  - macOS Apple Silicon → **CPU + Metal**
 - **Model manager:** resumable downloads with per-file + overall progress bars, verify/import for manually downloaded files, free-space pre-check. Weights come from `audio-cpp/Yue2-3B-GGUF` (`q4_0` ~2.6GB / `q8_0` ~4.2GB / `bf16` ~7.2GB, VAE f16 ~265MB / f32 ~531MB + 4 sidecars).
 - **Full YuE2 surface:** `cot` off/melody/full, ABC score paste/file (covers & edits), `guidance_scale`, all ABC + semantic sampling knobs, VAE choice, `weight_type`/`attention`, AR/NAR LoRA adapters, `--out-dir` score.abc export, engine diagnostics (`--list-devices`), lyrics load/save + built-in examples.
 - **Packaging:** PyInstaller in GitHub Actions — all compilation happens in CI, so you never build locally.
@@ -16,8 +16,7 @@ Standalone desktop GUI for **YuE2-3B** song generation powered by the native
 
 | File | Use |
 |------|-----|
-| `Yue2Studio-Windows-x64-CUDA.zip` | **Recommended for NVIDIA GPUs** (RTX 20/30/40/50, driver 580+). Runs `--backend cuda`, falls back to `--backend cpu`. Needs no CUDA Toolkit (runtime DLLs bundled). |
-| `Yue2Studio-Windows-x64.zip` | CPU-only portable build. Use when you have no NVIDIA GPU or are short on disk. |
+| `Yue2Studio-Windows-x64.zip` | All backends: `--backend cuda` on NVIDIA (driver 580+, RTX 20+), `--backend vulkan` on AMD/Intel, `--backend cpu` anywhere. CUDA runtime DLLs bundled — no Toolkit needed. |
 | `Yue2Studio-Linux-x64.tar.gz` | Portable: `tar -xzf ... && ./Yue2Studio/Yue2Studio` (needs `libsndfile1`: `sudo apt install libsndfile1`) |
 | `Yue2Studio-Linux-x64.AppImage` | Portable: `chmod +x ...AppImage && ./Yue2Studio-Linux-x64.AppImage` (needs FUSE: `sudo apt install libfuse2` on newer Ubuntu) |
 | `Yue2Studio-Linux-x64.rpm` | Install: `sudo dnf install ./Yue2Studio-Linux-x64.rpm`, then run `Yue2Studio` |
@@ -25,7 +24,7 @@ Standalone desktop GUI for **YuE2-3B** song generation powered by the native
 
 Models are **not** bundled — they download on first run from inside the app.
 
-To save CI time/space: GitHub repo → **Actions** → *Build & Release* → **Run workflow** and tick only the platforms you need (Windows CPU/CUDA, Linux, macOS, AppImage, RPM, CPU arch `avx2`/`baseline`).
+To save CI time/space: GitHub repo → **Actions** → *Build & Release* → **Run workflow** and tick only the platforms you need (Windows, Linux, macOS, AppImage, RPM, CPU arch `avx2`/`baseline`).
 
 ## Project layout
 
@@ -56,23 +55,33 @@ pip install -r requirements.txt
 ```
 
 2. Place your compiled `audiocpp_cli` binary into `bin/` (or have it on `PATH`).
-   Build only the `yue2` family to keep it small, and use **distributable**
-   CPU flags (never `native` for releases):
-
-```bash
-# Linux (CPU portable)
-./scripts/build_linux.sh --backend cpu --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
-
-# macOS (Metal)
-./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
-```
+   Build only the `yue2` family to keep it small. Upstream helper scripts
+   (`build_windows.ps1` presets, `build_linux.sh --backend`) each allow only
+   ONE GPU backend, so the all-in-one binary is configured with direct CMake
+   (CUDA+Vulkan together is allowed — only CUDA+HIP is forbidden):
 
 ```powershell
-# Windows (CPU portable — the crash fix for 0xC000001D)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cpu-release -CpuArch avx2 -ModelSet custom -Models "yue2" -Target audiocpp_cli
+# Windows (CPU+CUDA+Vulkan, portable — needs CUDA Toolkit + Vulkan SDK installed)
+cmake -S audio-cpp -B build/windows-all-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_NATIVE_CPU=OFF `
+  -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF `
+  -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF -DGGML_AVX_VNNI=OFF `
+  -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2
+cmake --build build/windows-all-release --target audiocpp_cli
+```
 
-# Windows (CUDA, includes CPU backend; portable multi-arch, not local-GPU-only)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cuda-release -CpuArch avx2 -CudaArchitectures default -ModelSet custom -Models "yue2" -Target audiocpp_cli
+```bash
+# Linux (CPU+CUDA+Vulkan, portable — needs CUDA Toolkit + libvulkan-dev + glslc)
+export CC=gcc-13 CXX=g++-13
+cmake -S audio-cpp -B build/linux-all-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_NATIVE_CPU=OFF \
+  -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2
+cmake --build build/linux-all-release --target audiocpp_cli
+```
+
+```bash
+# macOS (Metal) — helper script is fine, it only has one GPU backend anyway
+./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
 ```
 
    Copy **all** `bin/*.dll` next to the exe too (ggml backends, VCOMP140/VCRUNTIME,
@@ -133,13 +142,12 @@ Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App*
 
 ### Notes
 
-- Windows releases use `-CpuArch avx2` (**balance**) by default: no AVX-512-only
-  instructions, runs on most modern PCs. Pick `baseline` (+ slowest, most
-  compatible) only for very old CPUs. Never ship `-CpuArch native` publicly.
-- Linux builds use `--native-cpu OFF`; macOS Metal uses `--native-cpu OFF`.
-- Windows CUDA uses `-CudaArchitectures default` (portable 75/80/86/89/120a/121a
-  list), bundles `ggml-cuda`, MSVC/OpenMP and CUDA runtime DLLs, and still runs
-  `--backend cpu` when no NVIDIA GPU is present.
+- CPU kernels are portable by default (`-CpuArch avx2` balance on Windows /
+  `--native-cpu OFF` elsewhere: no AVX-512-only instructions). Pick `baseline`
+  only for very old CPUs. Never ship `native` builds publicly.
+- CUDA uses audio.cpp's portable multi-arch default (NOT local-GPU auto-detect),
+  bundles the CUDA runtime DLLs on Windows, and still runs `--backend cpu` when
+  no NVIDIA GPU is present. Vulkan needs a Vulkan 1.1+ driver (AMD/NVIDIA/Intel).
 - If `pygame` cannot initialise audio (headless CI), the GUI still runs and logs
   a warning; generated WAVs remain playable from `outputs/`.
 - Tkinter updates from worker threads are marshalled via `after()` so log
@@ -152,10 +160,11 @@ Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App*
   lacks. Solution: re-download the current release (built `-CpuArch avx2` /
   `--native-cpu OFF`), or use the CUDA build. The app now explains this inline
   in the logs instead of failing silently.
-- **CUDA backend missing** (`--backend cuda` rejected, no `*cuda*.dll` next to the exe).
-  You have the CPU-only zip. Download `Yue2Studio-Windows-x64-CUDA.zip`, keep all
-  DLLs next to the exe, update the NVIDIA driver (580+), and pick `cuda` (or `auto`
-  with `nvidia-smi` present).
+- **Backend rejected / slow GPU.** `auto` picks CUDA when `nvidia-smi` exists,
+  else CPU — AMD/Intel users should pick `vulkan` manually. Use
+  **Engine Info / List Devices** to confirm the binary reports
+  `cuda, cpu, vulkan`. CUDA needs driver 580+ (RTX 20+); Vulkan needs a
+  Vulkan 1.1+ driver; otherwise use `cpu`.
 - **Download stalls / fails.** The app streams with resume + progress bars and falls
   back to the Hub client (install `hf_xet`/`hf_transfer` via `requirements.txt`).
   Partial files live as `.part` and resume automatically. If HF is blocked, download

@@ -701,17 +701,26 @@ class Yue2StudioApp(ctk.CTk):
         def worker():
             self.log(f"[Engine] binary: {self.cli_path}")
             dlls = list_bundled_dlls()
-            self.log(f"[Engine] sibling DLLs ({len(dlls)}): {', '.join(dlls) if dlls else '(none)'}")
-            if platform.system() == "Windows" and "cuda" not in " ".join(dlls).lower() and "ggml-cuda" not in " ".join(dlls).lower():
-                self.log("[Engine] No CUDA DLLs next to the CLI → this is a CPU-only build. "
-                         "Use the -CUDA artifact for NVIDIA GPU acceleration.")
-            for args in (["--list-devices"], ["--help"]):
-                try:
-                    p = subprocess.run([self.cli_path] + args, capture_output=True, text=True, timeout=30)
-                    out = (p.stdout or "") + (p.stderr or "")
-                    self.log(f"[Engine] {' '.join(args)} (exit {p.returncode}):\n{out[:3000]}")
-                except Exception as e:
-                    self.log(f"[Engine] {' '.join(args)} failed: {e}")
+            self.log(f"[Engine] sibling DLLs ({len(dlls)}): {', '.join(dlls) if dlls else '(none — static build, backends compiled in)'}")
+            # Authoritative backend check: ask the binary itself. Static builds
+            # have no ggml-*.dll files, so DLL names prove nothing.
+            try:
+                p = subprocess.run([self.cli_path, "--list-devices"], capture_output=True, text=True, timeout=30)
+                out = (p.stdout or "") + (p.stderr or "")
+                found = sorted({b for b in ("cuda", "vulkan", "cpu", "metal", "hip") if b in out.lower()})
+                self.log(f"[Engine] --list-devices (exit {p.returncode}):\n{out[:3000]}")
+                self.log(f"[Engine] compiled backends detected: {', '.join(found) if found else '(unparseable — see above)'}")
+                if "cuda" not in found and "vulkan" not in found and platform.system() != "Darwin":
+                    self.log("[Engine] No GPU backend compiled in → CPU-only binary. "
+                             "Re-download the release (Windows/Linux zips ship CPU+CUDA+Vulkan).")
+            except Exception as e:
+                self.log(f"[Engine] --list-devices failed: {e}")
+            try:
+                p = subprocess.run([self.cli_path, "--help"], capture_output=True, text=True, timeout=30)
+                out = (p.stdout or "") + (p.stderr or "")
+                self.log(f"[Engine] --help (exit {p.returncode}):\n{out[:3000]}")
+            except Exception as e:
+                self.log(f"[Engine] --help failed: {e}")
             smi = shutil.which("nvidia-smi")
             self.log(f"[Engine] nvidia-smi: {'found' if smi else 'NOT found — CPU expected'}")
             if smi:
