@@ -34,9 +34,9 @@ on:
         options: [avx2, baseline]
         default: avx2
       cuda_arch:
-        description: 'CUDA GPU coverage (wider = slower build)'
+        description: 'CUDA coverage: nocuda=CPU+Vulkan only (fastest), wider = slower build'
         type: choice
-        options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
+        options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full', 'nocuda']
         default: 'rtx3040'
       appimage:
         description: 'Build Linux AppImage'
@@ -58,7 +58,8 @@ env:
   # 86-real + 89-real + 90-virtual + 120a-real). Presets (see cuda_arch input):
   # rtx3040=86;89 (RTX 30/40, ~2/9 nvcc work) | rtx203040=+75 (RTX 20/GTX 16)
   # gtx10plus=+61 (GTX 10xx) | legacy=+52 (GTX 9xx) | wide=trimmed 6-arch
-  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
+  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat)
+  # nocuda=CPU+Vulkan only: skips the toolkit install and nvcc entirely.
   # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
 
@@ -94,6 +95,9 @@ jobs:
           arch: x64
 
       - name: Install CUDA Toolkit
+        # Skipped for nocuda (CPU+Vulkan build): no nvcc needed. Empty on tag
+        # pushes, so this is true there and the toolkit still installs.
+        if: ${{ inputs.cuda_arch != 'nocuda' }}
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
@@ -151,10 +155,10 @@ jobs:
           # (CMakeCUDACompilerId.cu), so the build survives if the image ever
           # moves to VS18 again. Harmless on a supported compiler.
           $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
-          # Semicolons must stay quoted — bare ';' is a PowerShell statement separator.
-          # Named presets from the cuda_arch picker; 'full' omits the flag and
-          # lets upstream use its 9-arch default. default{} keeps raw arch
-          # lists working (env default + forward compat).
+          # Named presets from the cuda_arch picker. 'nocuda' disables CUDA
+          # entirely (CPU+Vulkan build, fastest, no toolkit needed); 'full'
+          # omits the arch flag and lets upstream use its 9-arch default.
+          # default{} keeps raw arch lists working (env default + forward compat).
           $cudaPreset = "${{ inputs.cuda_arch }}"
           if ([string]::IsNullOrEmpty($cudaPreset)) { $cudaPreset = $env:CUDA_ARCHES }
           $cudaArches = switch ($cudaPreset) {
@@ -163,16 +167,25 @@ jobs:
             "gtx10plus" { "61;75;86;89" }
             "legacy"    { "52;61;75;86;89" }
             "wide"      { "75-real;80-virtual;86-real;89-real;90-virtual;120a-real" }
+            "nocuda"    { "nocuda" }
             "full"      { "full" }
             default     { $cudaPreset }
           }
+          $noCuda = ($cudaArches -eq "nocuda")
+          $engineCuda = @("-DENGINE_ENABLE_CUDA=ON", "-DENGINE_ENABLE_CUDA_GRAPHS=ON")
           $cudaArchFlag = @()
-          if (-not [string]::IsNullOrEmpty($cudaArches) -and $cudaArches -ne "full") { $cudaArchFlag = @("-DCMAKE_CUDA_ARCHITECTURES=$cudaArches") }
+          $cudaRootFlag = @("-DCUDAToolkit_ROOT=$env:CUDA_PATH")
+          if ($noCuda) {
+            $engineCuda = @("-DENGINE_ENABLE_CUDA=OFF", "-DENGINE_ENABLE_CUDA_GRAPHS=OFF")
+            $cudaRootFlag = @()
+          } elseif (-not [string]::IsNullOrEmpty($cudaArches) -and $cudaArches -ne "full") {
+            $cudaArchFlag = @("-DCMAKE_CUDA_ARCHITECTURES=$cudaArches")
+          }
           cmake -S audio-cpp -B build/windows-all-release -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_FLAGS=/utf-8 "-DCMAKE_CXX_FLAGS=/utf-8 /EHsc" `
             -DOpenMP_C_FLAGS=/openmp:experimental -DOpenMP_CXX_FLAGS=/openmp:experimental `
-            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON `
+            @engineCuda `
             -DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_METAL=OFF `
             -DENGINE_ENABLE_OPENMP=ON -DGGML_OPENMP=ON `
             -DENGINE_ENABLE_NATIVE_CPU=OFF -DENGINE_ENABLE_LLAMAFILE=$llamafile `
@@ -180,7 +193,7 @@ jobs:
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
             @cudaArchFlag `
-            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+            @cudaRootFlag `
             "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
             throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
@@ -285,6 +298,9 @@ jobs:
           sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache glslc libvulkan-dev spirv-headers
 
       - name: Install CUDA Toolkit
+        # Skipped for nocuda (CPU+Vulkan build): no nvcc needed. Empty on tag
+        # pushes, so this is true there and the toolkit still installs.
+        if: ${{ inputs.cuda_arch != 'nocuda' }}
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
@@ -327,13 +343,17 @@ jobs:
             "gtx10plus") CUDA_ARCHES="61;75;86;89" ;;
             "legacy") CUDA_ARCHES="52;61;75;86;89" ;;
             "wide") CUDA_ARCHES="75-real;80-virtual;86-real;89-real;90-virtual;120a-real" ;;
+            "nocuda") CUDA_ARCHES="nocuda" ;;
             "full") CUDA_ARCHES="full" ;;
             *) CUDA_ARCHES="$CUDA_PRESET" ;;
           esac
+          # No CUDA at all: ggml CUDA backend off (CPU+Vulkan build, fastest).
+          ENGINE_CUDA_ARGS=("-DENGINE_ENABLE_CUDA=ON" "-DENGINE_ENABLE_CUDA_GRAPHS=ON")
+          if [ "$CUDA_ARCHES" = "nocuda" ]; then ENGINE_CUDA_ARGS=("-DENGINE_ENABLE_CUDA=OFF" "-DENGINE_ENABLE_CUDA_GRAPHS=OFF"); fi
           # Array (not a plain string): ';' must never be unquoted in bash,
           # and a quoted-empty string would reach cmake as a bogus empty arg.
           CUDA_ARCH_ARGS=()
-          if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
+          if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ] && [ "$CUDA_ARCHES" != "nocuda" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
@@ -344,7 +364,7 @@ jobs:
           cmake -S audio-cpp -B build/linux-all-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
-            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON \
+            "${ENGINE_CUDA_ARGS[@]}" \
             -DENGINE_ENABLE_VULKAN=ON \
             -DENGINE_ENABLE_NATIVE_CPU=OFF \
             -DENGINE_ENABLE_LLAMAFILE=ON \
