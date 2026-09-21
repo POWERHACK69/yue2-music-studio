@@ -125,8 +125,13 @@ jobs:
             @isa `
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
-            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
-            "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8"
+          # -allow-unsupported-compiler: windows-latest runners now ship Visual
+          # Studio 18, which CUDA 12.8's nvcc gates in host_config.h (fatal
+          # C1189, only VS 2017-2022 allowed) — upstream builds on
+          # windows-2022 so never hits this. This is nvcc's own suggested
+          # override; VS minor-version bumps are normally harmless here.
+          -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+          "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
             throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
           }
