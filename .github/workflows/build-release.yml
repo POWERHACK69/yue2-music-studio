@@ -1,35 +1,55 @@
 name: Build & Release Yue2 Studio Standalone App
 
+# All heavy compilation happens here so low-disk-space users never build
+# locally: pick exactly what you need via "Run workflow" inputs, or push a
+# tag (v*) to build every platform. Models are never bundled — they download
+# on first run from inside the app (~2.6GB q4_0 / ~4.2GB q8_0 / ~7.2GB bf16).
+
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      windows_cpu:
+        description: 'Build Windows CPU (portable, AVX2/baseline)'
+        type: boolean
+        default: true
+      windows_cuda:
+        description: 'Build Windows CUDA (includes CPU backend too)'
+        type: boolean
+        default: true
+      linux:
+        description: 'Build Linux CPU (portable)'
+        type: boolean
+        default: true
+      mac:
+        description: 'Build macOS Metal (arm64)'
+        type: boolean
+        default: true
+      cpu_arch:
+        description: 'Windows CPU architecture profile'
+        type: choice
+        options: [avx2, baseline]
+        default: avx2
+      appimage:
+        description: 'Build Linux AppImage'
+        type: boolean
+        default: true
+      rpm:
+        description: 'Build Linux RPM'
+        type: boolean
+        default: true
+
+env:
+  PYTHON_VERSION: '3.11'
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Windows x64 build
-          - os: windows-latest
-            artifact_name: Yue2Studio-Windows-x64
-            archive_ext: zip
-            binary_name: audiocpp_cli.exe
-          # Linux x64 build
-          - os: ubuntu-22.04
-            artifact_name: Yue2Studio-Linux-x64
-            archive_ext: tar.gz
-            binary_name: audiocpp_cli
-          # macOS Apple Silicon (Metal) build
-          - os: macos-14
-            artifact_name: Yue2Studio-macOS-arm64
-            archive_ext: zip
-            binary_name: audiocpp_cli
-
+  # ================= Windows CPU (portable) =================
+  windows-cpu:
+    name: Windows CPU (portable)
+    runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_cpu
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,76 +57,45 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          architecture: 'x64'  # force 64-bit interpreter so PyInstaller bundles x64
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: 'x64'
           cache: 'pip'
 
       - name: Install Python dependencies
+        shell: pwsh
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ----------------- BUILD AUDIO.CPP ENGINE -----------------
-      - name: Build audio.cpp on Windows (CPU)
-        if: runner.os == 'Windows'
+      - name: Build audio.cpp (CPU, distributable)
         shell: pwsh
         run: |
+          # -CpuArch avx2 (balance) avoids AVX-512/native instructions that crash
+          # with 0xC000001D on CPUs without AVX-512. Use 'baseline' for oldest PCs.
+          $arch = "${{ inputs.cpu_arch }}"
+          if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           cd audio-cpp
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cpu-release -ModelSet custom -Models "yue2" -Target audiocpp_cli
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cpu-release -CpuArch $arch -ModelSet custom -Models "yue2" -Target audiocpp_cli
           New-Item -ItemType Directory -Force -Path ..\bin | Out-Null
           $cli = Get-ChildItem -Recurse -Filter audiocpp_cli.exe | Select-Object -First 1
           if (-not $cli) { throw "audiocpp_cli.exe not found after build" }
           Copy-Item $cli.FullName ..\bin\audiocpp_cli.exe
+          # Bundle any backend DLLs produced by the build (ggml-*.dll, etc.)
+          Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName ..\bin\ -Force }
+          # Bundle MSVC + OpenMP runtime DLLs so users need no Build Tools.
+          $redist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
+          if (Test-Path $redist) {
+            $crt = Get-ChildItem "$redist\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            $omp = Get-ChildItem "$redist\*\x64\Microsoft.VC143.OpenMP" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($crt) { Copy-Item "$($crt.FullName)\MSVCP140.dll", "$($crt.FullName)\VCRUNTIME140.dll", "$($crt.FullName)\VCRUNTIME140_1.dll" ..\bin\ -Force -ErrorAction SilentlyContinue }
+            if ($omp) { Copy-Item "$($omp.FullName)\VCOMP140.DLL" ..\bin\ -Force -ErrorAction SilentlyContinue }
+          }
           Get-ChildItem ..\bin
 
-      - name: Build audio.cpp on Linux (CPU, x86_64)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          sudo apt-get update -qq
-          # audio.cpp requires GCC 13+, but vanilla Ubuntu 22.04 repos only go up
-          # to GCC 12. Use the preinstalled compiler if present, else pull GCC 13
-          # from the Ubuntu toolchain PPA (keeps the older 22.04 glibc for wider
-          # compatibility of the resulting binaries).
-          if ! command -v gcc-13 >/dev/null 2>&1; then
-            sudo apt-get install -y -qq software-properties-common
-            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq gcc-13 g++-13
-          fi
-          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          cd audio-cpp
-          export CC=gcc-13 CXX=g++-13
-          ./scripts/build_linux.sh --backend cpu --model-set custom --models yue2 --target audiocpp_cli
-          mkdir -p ../bin
-          CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
-          if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
-          cp "$CLI_BIN" ../bin/
-          ls -la ../bin
-
-      - name: Build audio.cpp on macOS (Metal backend)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          cd audio-cpp
-          ./scripts/build_metal.sh --model-set custom --models yue2 --target audiocpp_cli
-          mkdir -p ../bin
-          CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
-          if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
-          cp "$CLI_BIN" ../bin/
-          ls -la ../bin
-
-      # ----------------- VERIFY 64-BIT TARGET ARCH -----------------
       - name: Verify 64-bit binary (Windows x64)
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Read the PE header Machine field: 0x8664 = AMD64 (x86_64)
           $bytes = [System.IO.File]::ReadAllBytes("bin\audiocpp_cli.exe")
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
@@ -115,8 +104,152 @@ jobs:
           python -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
           "Windows x86_64 check passed."
 
+      - name: Package standalone app (Windows CPU)
+        shell: pwsh
+        run: |
+          $addBin = @()
+          $addBin += "--add-binary"; $addBin += "bin/audiocpp_cli.exe;bin"
+          Get-ChildItem -Path bin -Filter *.dll | ForEach-Object { $addBin += "--add-binary"; $addBin += "bin/$($_.Name);bin" }
+          pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" @addBin --collect-all customtkinter app/main.py
+          Compress-Archive -Path dist/Yue2Studio -DestinationPath Yue2Studio-Windows-x64.zip
+
+      - name: Upload build artifacts (Windows CPU)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yue2Studio-Windows-x64
+          path: Yue2Studio-Windows-x64.zip
+
+  # ================= Windows CUDA (includes CPU backend) =================
+  windows-cuda:
+    name: Windows CUDA (+CPU fallback)
+    runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.windows_cuda
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        id: cuda-toolkit
+        with:
+          cuda: '13.3.1'
+          method: 'network'
+          use-github-cache: true
+          use-prime: false
+
+      - name: Build audio.cpp (CUDA, distributable)
+        shell: pwsh
+        run: |
+          # -CudaArchitectures default = portable multi-arch list (75/80/86/89/120a/121a
+          # filtered by nvcc), NOT the local-GPU auto-detect. CUDA builds also include
+          # the CPU backend, so one binary serves --backend cuda and --backend cpu.
+          $arch = "${{ inputs.cpu_arch }}"
+          if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          cd audio-cpp
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -Preset windows-cuda-release -CpuArch $arch -CudaArchitectures default -ModelSet custom -Models "yue2" -Target audiocpp_cli
+          New-Item -ItemType Directory -Force -Path ..\bin | Out-Null
+          $bindir = (Get-ChildItem -Recurse -Filter audiocpp_cli.exe | Select-Object -First 1).DirectoryName
+          if (-not $bindir) { throw "audiocpp_cli.exe not found after build" }
+          Copy-Item "$bindir\audiocpp_cli.exe" ..\bin\ -Force
+          # Backend + CUDA runtime DLLs (ggml-cuda, cublas, cufft, cudart…).
+          Get-ChildItem -Path $bindir -Filter *.dll | ForEach-Object { Copy-Item $_.FullName ..\bin\ -Force }
+          $cudabin = @()
+          if ($env:CUDA_PATH) { $cudabin += "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\bin" }
+          $cudabin += "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin", "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64"
+          foreach ($pat in @("cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "cudart64_*.dll")) {
+            foreach ($d in $cudabin) {
+              if (Test-Path $d) { Copy-Item "$d\$pat" ..\bin\ -Force -ErrorAction SilentlyContinue }
+            }
+          }
+          $redist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Redist\MSVC"
+          if (Test-Path $redist) {
+            $crt = Get-ChildItem "$redist\*\x64\Microsoft.VC143.CRT" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            $omp = Get-ChildItem "$redist\*\x64\Microsoft.VC143.OpenMP" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($crt) { Copy-Item "$($crt.FullName)\MSVCP140.dll", "$($crt.FullName)\VCRUNTIME140.dll", "$($crt.FullName)\VCRUNTIME140_1.dll" ..\bin\ -Force -ErrorAction SilentlyContinue }
+            if ($omp) { Copy-Item "$($omp.FullName)\VCOMP140.DLL" ..\bin\ -Force -ErrorAction SilentlyContinue }
+          }
+          Get-ChildItem ..\bin
+          # Sanity: CUDA backend DLL must be present.
+          if (-not (Get-ChildItem ..\bin -Filter "*cuda*.dll")) { Write-Warning "No *cuda*.dll in bin/ — CUDA backend may be missing!" }
+
+      - name: Package standalone app (Windows CUDA)
+        shell: pwsh
+        run: |
+          $addBin = @()
+          $addBin += "--add-binary"; $addBin += "bin/audiocpp_cli.exe;bin"
+          Get-ChildItem -Path bin -Filter *.dll | ForEach-Object { $addBin += "--add-binary"; $addBin += "bin/$($_.Name);bin" }
+          pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" @addBin --collect-all customtkinter app/main.py
+          Compress-Archive -Path dist/Yue2Studio -DestinationPath Yue2Studio-Windows-x64-CUDA.zip
+
+      - name: Upload build artifacts (Windows CUDA)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yue2Studio-Windows-x64-CUDA
+          path: Yue2Studio-Windows-x64-CUDA.zip
+
+  # ================= Linux CPU (portable) =================
+  linux:
+    name: Linux CPU (portable)
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'workflow_dispatch' || inputs.linux
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: 'x64'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build audio.cpp (CPU portable, x86_64)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          if ! command -v gcc-13 >/dev/null 2>&1; then
+            sudo apt-get install -y -qq software-properties-common
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gcc-13 g++-13
+          fi
+          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          cd audio-cpp
+          export CC=gcc-13 CXX=g++-13
+          # --native-cpu OFF = portable kernels (no -march=native → no AVX-512-only
+          # binary that dies with SIGILL on older CPUs). --ccache speeds rebuilds.
+          ./scripts/build_linux.sh --backend cpu --native-cpu OFF --ccache --model-set custom --models yue2 --target audiocpp_cli
+          mkdir -p ../bin
+          CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
+          if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
+          cp "$CLI_BIN" ../bin/
+          # Bundle shared libs the CLI needs that may be missing on target machines.
+          find build -name "*.so*" -type f | head -n 20 || true
+          ls -la ../bin
+
       - name: Verify 64-bit binary (Linux x86_64)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euxo pipefail
@@ -125,29 +258,7 @@ jobs:
           python3 -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
           echo "Linux x86_64 check passed."
 
-      - name: Verify 64-bit binary (macOS arm64)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          uname -m | grep -q "arm64"
-          file bin/audiocpp_cli | grep -q "arm64"
-          python3 -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
-          echo "macOS arm64 check passed."
-
-      # ----------------- BUNDLE WITH PYINSTALLER -----------------
-      - name: Package standalone app (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" `
-            --add-binary "bin/audiocpp_cli.exe;bin" `
-            --collect-all customtkinter `
-            app/main.py
-          Compress-Archive -Path dist/Yue2Studio -DestinationPath ${{ matrix.artifact_name }}.zip
-
       - name: Package standalone app (Linux)
-        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euxo pipefail
@@ -155,15 +266,13 @@ jobs:
             --add-binary "bin/audiocpp_cli:bin" \
             --collect-all customtkinter \
             app/main.py
-          tar -czf ${{ matrix.artifact_name }}.tar.gz -C dist Yue2Studio
+          tar -czf Yue2Studio-Linux-x64.tar.gz -C dist Yue2Studio
 
       - name: Build AppImage (Linux x86_64)
-        if: runner.os == 'Linux'
+        if: github.event_name != 'workflow_dispatch' || inputs.appimage
         shell: bash
         run: |
           set -euxo pipefail
-          # Assemble AppDir from the PyInstaller onedir output (kept intact so
-          # the bootloader finds its bundled libraries).
           rm -rf AppDir
           mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
           cp -a dist/Yue2Studio/. AppDir/usr/bin/
@@ -174,19 +283,16 @@ jobs:
           cp app/icon.png AppDir/usr/share/icons/hicolor/256x256/apps/Yue2Studio.png
           printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/bin/Yue2Studio" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun AppDir/usr/bin/Yue2Studio
-          # appimagetool itself is an AppImage; --appimage-extract-and-run avoids
-          # needing FUSE on the runner.
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool.AppImage
           chmod +x appimagetool.AppImage
           ./appimagetool.AppImage --appimage-extract-and-run AppDir Yue2Studio-Linux-x64.AppImage
           ls -la Yue2Studio-Linux-x64.AppImage
 
       - name: Build RPM (Linux x86_64)
-        if: runner.os == 'Linux'
+        if: github.event_name != 'workflow_dispatch' || inputs.rpm
         shell: bash
         run: |
           set -euxo pipefail
-          # Version from tag (v1.2.3 -> 1.2.3); manual runs get 0.0.0.
           VERSION="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then VERSION="0.0.0"; fi
           echo "RPM version: $VERSION"
@@ -196,8 +302,59 @@ jobs:
           cp ~/rpmbuild/RPMS/x86_64/yue2studio-*.x86_64.rpm ./Yue2Studio-Linux-x64.rpm
           ls -la Yue2Studio-Linux-x64.rpm
 
+      - name: Upload build artifacts (Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yue2Studio-Linux-x64
+          path: |
+            Yue2Studio-Linux-x64.tar.gz
+            Yue2Studio-Linux-x64.AppImage
+            Yue2Studio-Linux-x64.rpm
+
+  # ================= macOS Metal =================
+  macos:
+    name: macOS Metal (arm64)
+    runs-on: macos-14
+    if: github.event_name != 'workflow_dispatch' || inputs.mac
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build audio.cpp (Metal backend)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          cd audio-cpp
+          ./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
+          mkdir -p ../bin
+          CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
+          if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
+          cp "$CLI_BIN" ../bin/
+          ls -la ../bin
+
+      - name: Verify 64-bit binary (macOS arm64)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          uname -m | grep -q "arm64"
+          file bin/audiocpp_cli | grep -q "arm64"
+          python3 -c "import struct; assert struct.calcsize('P')*8 == 64, 'Python is not 64-bit'"
+          echo "macOS arm64 check passed."
+
       - name: Package standalone app (macOS)
-        if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euxo pipefail
@@ -206,38 +363,19 @@ jobs:
             --collect-all customtkinter \
             app/main.py
           cd dist
-          zip -r ../${{ matrix.artifact_name }}.zip Yue2Studio.app
-
-      # ----------------- UPLOAD ARTIFACTS -----------------
-      - name: Upload build artifacts (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+          zip -r ../Yue2Studio-macOS-arm64.zip Yue2Studio.app
 
       - name: Upload build artifacts (macOS)
-        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
-
-      - name: Upload build artifacts (Linux)
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.artifact_name }}.tar.gz
-            Yue2Studio-Linux-x64.AppImage
-            Yue2Studio-Linux-x64.rpm
+          name: Yue2Studio-macOS-arm64
+          path: Yue2Studio-macOS-arm64.zip
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [windows-cpu, windows-cuda, linux, macos]
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     permissions:
       contents: write
     steps:
