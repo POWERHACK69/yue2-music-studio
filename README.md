@@ -145,8 +145,9 @@ Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App*
 - CPU kernels are portable by default (`-CpuArch avx2` balance on Windows /
   `--native-cpu OFF` elsewhere: no AVX-512-only instructions). Pick `baseline`
   only for very old CPUs. Never ship `native` builds publicly.
-- CUDA uses a trimmed arch list (`75-real;80-virtual;86-real;89-real;90-virtual;120a-real`,
-  Turing→Blackwell, override via `cuda_arch` input — NOT local-GPU auto-detect),
+- CUDA builds for RTX 30/40 by default for fast CI — widen coverage in the
+  Run workflow picker (`cuda_arch`: `rtx203040`, `gtx10plus`, `legacy` for
+  GTX 9xx-era, `wide`, or `full`) when you need older/newer cards (NOT local-GPU auto-detect),
   bundles the CUDA runtime DLLs on Windows, and still runs `--backend cpu` when
   no NVIDIA GPU is present. Vulkan needs a Vulkan 1.1+ driver (AMD/NVIDIA/Intel).
 - If `pygame` cannot initialise audio (headless CI), the GUI still runs and logs
