@@ -9,6 +9,11 @@ name: Build & Release Yue2 Studio Standalone App
 # compilation happens in CI, so low-disk-space users never build locally.
 # Models are never bundled — they download on first run from inside the app
 # (~2.6GB q4_0 / ~4.2GB q8_0 / ~7.2GB bf16).
+#
+# CUDA packaging: both CUDA jobs bundle the CUDA runtime next to the CLI
+# (cudart/cublas/cublasLt/cufft/nvJitLink). ggml links these dynamically and
+# cuBLAS has no static variant, so without them the shipped app cannot use
+# CUDA on machines without a toolkit (and may not start at all).
 
 on:
   push:
@@ -34,9 +39,9 @@ on:
         options: [avx2, baseline]
         default: avx2
       cuda_arch:
-        description: 'CUDA coverage: nocuda=CPU+Vulkan only (fastest), wider = slower build'
+        description: 'CUDA GPU coverage (wider = slower build)'
         type: choice
-        options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full', 'nocuda']
+        options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
         default: 'rtx3040'
       appimage:
         description: 'Build Linux AppImage'
@@ -58,8 +63,7 @@ env:
   # 86-real + 89-real + 90-virtual + 120a-real). Presets (see cuda_arch input):
   # rtx3040=86;89 (RTX 30/40, ~2/9 nvcc work) | rtx203040=+75 (RTX 20/GTX 16)
   # gtx10plus=+61 (GTX 10xx) | legacy=+52 (GTX 9xx) | wide=trimmed 6-arch
-  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat)
-  # nocuda=CPU+Vulkan only: skips the toolkit install and nvcc entirely.
+  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
   # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
 
@@ -95,9 +99,6 @@ jobs:
           arch: x64
 
       - name: Install CUDA Toolkit
-        # Skipped for nocuda (CPU+Vulkan build): no nvcc needed. Empty on tag
-        # pushes, so this is true there and the toolkit still installs.
-        if: ${{ inputs.cuda_arch != 'nocuda' }}
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
@@ -137,10 +138,10 @@ jobs:
           $arch = "${{ inputs.cpu_arch }}"
           if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
           if ($arch -eq "baseline") {
-            $isa = @("-DGGML_AVX=OFF", "-DGGML_AVX2=OFF", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AVX_VNNI=OFF")
+            $isa = @("-DGGML_AVX=OFF", "-DGGML_AVX2=OFF", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AV_VNNI=OFF")
             $llamafile = "OFF"
           } else {
-            $isa = @("-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AVX_VNNI=OFF")
+            $isa = @("-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AV_VNNI=ON")
             $llamafile = "ON"
           }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
@@ -150,15 +151,20 @@ jobs:
           # "The term '-DCUDAToolkit_ROOT=...' is not recognized".
           # Keep this cmake invocation comment-free.
           # VS compat: runner is pinned to windows-2022 (VS17/VS 2022, supported
-          # by CUDA 12.8). NVCC_PREPEND_FLAGS is belt-and-braces: unlike
-          # -DCMAKE_CUDA_FLAGS it also covers CMake's CUDA compiler-id check
-          # (CMakeCUDACompilerId.cu), so the build survives if the image ever
-          # moves to VS18 again. Harmless on a supported compiler.
+          # by CUDA 12.8). NVCC_PREPEND_OPTIONS is the documented env var and
+          # applies to every nvcc invocation, including CMake's CUDA compiler-id
+          # check (CMakeCUDACompilerId.cu); NVCC_PREPEND_FLAGS is kept as an
+          # alias some tooling reads. Belt-and-braces for a VS18 host move.
+          $env:NVCC_PREPEND_OPTIONS = "-allow-unsupported-compiler"
           $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
-          # Named presets from the cuda_arch picker. 'nocuda' disables CUDA
-          # entirely (CPU+Vulkan build, fastest, no toolkit needed); 'full'
-          # omits the arch flag and lets upstream use its 9-arch default.
-          # default{} keeps raw arch lists working (env default + forward compat).
+          # Semicolons must stay quoted — bare ';' is a PowerShell statement separator.
+          # Named presets from the cuda_arch picker; 'full' omits the flag and
+          # lets upstream use its 9-arch default. default{} keeps raw arch
+          # lists working (env default + forward compat).
+          # NOTE: 'wide' contains 120a-real, which needs a CMake that knows
+          # Blackwell (>= 4.1); the runner image's own CMake is recent enough.
+          # If configure ever rejects it, drop 120a-real — the 90-virtual PTX
+          # still JIT-runs on Blackwell.
           $cudaPreset = "${{ inputs.cuda_arch }}"
           if ([string]::IsNullOrEmpty($cudaPreset)) { $cudaPreset = $env:CUDA_ARCHES }
           $cudaArches = switch ($cudaPreset) {
@@ -167,25 +173,16 @@ jobs:
             "gtx10plus" { "61;75;86;89" }
             "legacy"    { "52;61;75;86;89" }
             "wide"      { "75-real;80-virtual;86-real;89-real;90-virtual;120a-real" }
-            "nocuda"    { "nocuda" }
             "full"      { "full" }
             default     { $cudaPreset }
           }
-          $noCuda = ($cudaArches -eq "nocuda")
-          $engineCuda = @("-DENGINE_ENABLE_CUDA=ON", "-DENGINE_ENABLE_CUDA_GRAPHS=ON")
           $cudaArchFlag = @()
-          $cudaRootFlag = @("-DCUDAToolkit_ROOT=$env:CUDA_PATH")
-          if ($noCuda) {
-            $engineCuda = @("-DENGINE_ENABLE_CUDA=OFF", "-DENGINE_ENABLE_CUDA_GRAPHS=OFF")
-            $cudaRootFlag = @()
-          } elseif (-not [string]::IsNullOrEmpty($cudaArches) -and $cudaArches -ne "full") {
-            $cudaArchFlag = @("-DCMAKE_CUDA_ARCHITECTURES=$cudaArches")
-          }
+          if (-not [string]::IsNullOrEmpty($cudaArches) -and $cudaArches -ne "full") { $cudaArchFlag = @("-DCMAKE_CUDA_ARCHITECTURES=$cudaArches") }
           cmake -S audio-cpp -B build/windows-all-release -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_FLAGS=/utf-8 "-DCMAKE_CXX_FLAGS=/utf-8 /EHsc" `
             -DOpenMP_C_FLAGS=/openmp:experimental -DOpenMP_CXX_FLAGS=/openmp:experimental `
-            @engineCuda `
+            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON `
             -DENGINE_ENABLE_VULKAN=ON -DENGINE_ENABLE_METAL=OFF `
             -DENGINE_ENABLE_OPENMP=ON -DGGML_OPENMP=ON `
             -DENGINE_ENABLE_NATIVE_CPU=OFF -DENGINE_ENABLE_LLAMAFILE=$llamafile `
@@ -193,7 +190,7 @@ jobs:
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
             @cudaArchFlag `
-            @cudaRootFlag `
+            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
             "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
             throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
@@ -206,10 +203,12 @@ jobs:
           Copy-Item $cli.FullName bin\audiocpp_cli.exe
           # Any backend DLLs produced by the build (shared-backend layout).
           Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName bin\ -Force }
-          # CUDA runtime DLLs (always dynamic) from the toolkit.
+          # CUDA runtime DLLs (always dynamic) from the toolkit. nvjitlink is
+          # required by cuBLAS/cuFFT in CUDA 12.x — forgetting it is the
+          # classic "missing nvjitlink_128_0.dll" failure on clean machines.
           foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
             if (Test-Path $d) {
-              foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll")) {
+              foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "nvjitlink*.dll")) {
                 Copy-Item "$d\$pat" bin\ -Force -ErrorAction SilentlyContinue
               }
             }
@@ -230,6 +229,18 @@ jobs:
               }
             }
           }
+          # Hard-fail if CUDA silently did not make it into the build (renamed
+          # upstream flag, failed toolkit detection, ...). A CUDA-enabled build
+          # either imports the CUDA runtime DLLs in the exe, produces a shared
+          # ggml-cuda backend DLL, or shows GGML_CUDA=ON in the cache — so this
+          # can never ship a CPU/Vulkan-only zip by accident.
+          $cudaLinked = $false
+          if (Get-ChildItem -Recurse -Path build/windows-all-release -Filter "*cuda*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1) { $cudaLinked = $true }
+          if (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_CUDA:BOOL=ON$" -Quiet) { $cudaLinked = $true }
+          if (-not $cudaLinked -and (Get-Command dumpbin -ErrorAction SilentlyContinue)) {
+            if (& dumpbin /dependents bin\audiocpp_cli.exe | Select-String -Pattern "cudart64|cublas64|cufft64|nvjitlink" -Quiet) { $cudaLinked = $true }
+          }
+          if (-not $cudaLinked) { throw "CUDA backend was not linked into the build" }
           Get-ChildItem bin
           # Prove all three backends compiled in (informational: no GPU on runner).
           .\bin\audiocpp_cli.exe --list-devices
@@ -295,12 +306,9 @@ jobs:
           if ! command -v gcc-13 >/dev/null 2>&1; then
             sudo apt-get install -y -qq gcc-13 g++-13
           fi
-          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache glslc libvulkan-dev spirv-headers
+          sudo apt-get install -y -qq cmake ninja-build libsndfile1-dev rpm file ccache glslc libvulkan-dev spirv-headers patchelf
 
       - name: Install CUDA Toolkit
-        # Skipped for nocuda (CPU+Vulkan build): no nvcc needed. Empty on tag
-        # pushes, so this is true there and the toolkit still installs.
-        if: ${{ inputs.cuda_arch != 'nocuda' }}
         uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
@@ -335,6 +343,10 @@ jobs:
           # CUDA coverage presets from the cuda_arch picker (default '86;89'):
           # each .cu compiles Nx. 'full' omits the flag and restores the
           # 9-arch portable default. The *) branch keeps raw arch lists working.
+          # NOTE: 'wide' contains 120a-real, which needs a CMake that knows
+          # Blackwell (>= 4.1). The runner image's own CMake (in /usr/local/bin,
+          # ahead of apt's 3.28) is recent enough; if configure ever rejects it,
+          # drop 120a-real — the 90-virtual PTX still JIT-runs on Blackwell.
           CUDA_PRESET="${{ inputs.cuda_arch }}"
           if [ -z "$CUDA_PRESET" ]; then CUDA_PRESET="$CUDA_ARCHES"; fi
           case "$CUDA_PRESET" in
@@ -343,17 +355,13 @@ jobs:
             "gtx10plus") CUDA_ARCHES="61;75;86;89" ;;
             "legacy") CUDA_ARCHES="52;61;75;86;89" ;;
             "wide") CUDA_ARCHES="75-real;80-virtual;86-real;89-real;90-virtual;120a-real" ;;
-            "nocuda") CUDA_ARCHES="nocuda" ;;
             "full") CUDA_ARCHES="full" ;;
             *) CUDA_ARCHES="$CUDA_PRESET" ;;
           esac
-          # No CUDA at all: ggml CUDA backend off (CPU+Vulkan build, fastest).
-          ENGINE_CUDA_ARGS=("-DENGINE_ENABLE_CUDA=ON" "-DENGINE_ENABLE_CUDA_GRAPHS=ON")
-          if [ "$CUDA_ARCHES" = "nocuda" ]; then ENGINE_CUDA_ARGS=("-DENGINE_ENABLE_CUDA=OFF" "-DENGINE_ENABLE_CUDA_GRAPHS=OFF"); fi
           # Array (not a plain string): ';' must never be unquoted in bash,
           # and a quoted-empty string would reach cmake as a bogus empty arg.
           CUDA_ARCH_ARGS=()
-          if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ] && [ "$CUDA_ARCHES" != "nocuda" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
+          if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
@@ -364,7 +372,7 @@ jobs:
           cmake -S audio-cpp -B build/linux-all-release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
-            "${ENGINE_CUDA_ARGS[@]}" \
+            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_CUDA_GRAPHS=ON \
             -DENGINE_ENABLE_VULKAN=ON \
             -DENGINE_ENABLE_NATIVE_CPU=OFF \
             -DENGINE_ENABLE_LLAMAFILE=ON \
@@ -379,6 +387,49 @@ jobs:
           cp "$CLI_BIN" bin/
           # Any shared backend libs produced by the build.
           find "$(dirname "$CLI_BIN")" -maxdepth 1 -name "*.so*" -type f -exec cp {} bin/ \; || true
+          ls -la bin
+          # ---- Bundle the CUDA runtime: end users will NOT have a toolkit ----
+          # ggml links cudart/cublas/cublasLt/cufft dynamically (cuBLAS has no
+          # static variant), and cuBLASLt/cuFFT in CUDA 12.x also need
+          # nvJitLink. Without these libs next to the binary the packaged app
+          # cannot use CUDA on a clean machine — and if CUDA is linked
+          # straight into audiocpp_cli it will not even start (missing
+          # DT_NEEDED entry).
+          : "${CUDA_PATH:=/usr/local/cuda}"
+          CUDA_LIB_DIRS=("${CUDA_PATH}/lib64" "${CUDA_PATH}/lib" "/usr/local/cuda/lib64")
+          for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcufft.so.11 libnvJitLink.so.12; do
+            found=""
+            for d in "${CUDA_LIB_DIRS[@]}"; do
+              if [ -e "$d/$lib" ]; then found="$d/$lib"; break; fi
+            done
+            if [ -n "$found" ]; then
+              cp -L "$found" bin/
+            else
+              echo "WARNING: $lib not found in the CUDA toolkit — CUDA runtime incomplete"
+            fi
+          done
+          # Self-contained lookup: CMake bakes absolute build-machine rpaths
+          # (/usr/local/cuda-12.8/lib64) into the binary — useless on user
+          # machines. $ORIGIN makes the CLI, shared ggml backends and the CUDA
+          # runtime resolve each other from their own directory, which is
+          # exactly where PyInstaller puts them (_internal/bin) in every
+          # package format (tar.gz, AppImage, RPM).
+          patchelf --set-rpath '$ORIGIN' bin/audiocpp_cli
+          for so in bin/*.so*; do
+            if [ -f "$so" ]; then patchelf --set-rpath '$ORIGIN' "$so"; fi
+          done
+          # Hard-fail if CUDA silently did not make it into the build (renamed
+          # upstream flag, failed toolkit detection, ...). Signals: the exe
+          # links the CUDA runtime, a shared ggml-cuda backend exists, or
+          # ggml's cache says GGML_CUDA=ON. Any one is sufficient proof.
+          CUDA_LINKED=0
+          if ldd bin/audiocpp_cli | grep -Eq 'libcublas|libcudart|libcufft'; then CUDA_LINKED=1; fi
+          if find build/linux-all-release -type f -name '*cuda*.so*' | grep -q .; then CUDA_LINKED=1; fi
+          if grep -q '^GGML_CUDA:BOOL=ON$' build/linux-all-release/CMakeCache.txt; then CUDA_LINKED=1; fi
+          if [ "${CUDA_LINKED}" -ne 1 ]; then
+            echo "ERROR: CUDA backend was not linked into the build"
+            exit 1
+          fi
           ls -la bin
           # Prove all three backends compiled in (informational: no GPU on runner).
           ./bin/audiocpp_cli --list-devices || ./bin/audiocpp_cli --help | head -n 40
@@ -397,7 +448,11 @@ jobs:
         run: |
           set -euxo pipefail
           BIN_ARGS=(--add-binary "bin/audiocpp_cli:bin")
-          for so in bin/*.so*; do [ -f "$so" ] && BIN_ARGS+=(--add-binary "$so:bin"); done
+          # 'if' form on purpose: '[ -f ] && cmd' as the last loop statement
+          # aborts the whole step under 'set -e' when the glob matches nothing.
+          for so in bin/*.so*; do
+            if [ -f "$so" ]; then BIN_ARGS+=(--add-binary "$so:bin"); fi
+          done
           pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" \
             "${BIN_ARGS[@]}" \
             --collect-all customtkinter \
