@@ -18,8 +18,13 @@ name: Build & Release Yue2 Studio Standalone App
 # DLL/DSO closure: the Windows job walks the exe's full static-import graph
 # with dumpbin and bundles every non-system DLL it can locate (build tree,
 # CUDA toolkit, Vulkan SDK, PATH); the Linux job does the same via ldd.
-# Anything unresolvable is NAMED in the error instead of a bare
-# 0xC0000135 / loader message.
+# Special classes:
+#   * api-ms-win-* / ext-ms-win-* are Windows API-set contracts resolved by
+#     the OS loader — skipped entirely (never bundled, never "missing").
+#   * nvcuda.dll / nvml.dll / nvapi64.dll (Win) and libcuda.so.1 /
+#     libnvidia-ml.so.1 (Linux) ship ONLY with the NVIDIA display driver. A
+#     static import of one means the binary cannot start on machines without
+#     an NVIDIA driver — an upstream regression, hard-failed by name.
 #
 # Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
 # application level (nothing to enumerate). That is tolerated. What is NOT
@@ -55,6 +60,10 @@ on:
         type: choice
         options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
         default: 'rtx3040'
+      audiocpp_ref:
+        description: 'audio.cpp ref override (branch/tag/SHA) — overrides env.AUDIOCPP_REF for this run only'
+        type: string
+        default: ''
       appimage:
         description: 'Build Linux AppImage'
         type: boolean
@@ -78,12 +87,12 @@ env:
   # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
   # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
-  # Pin the audio.cpp source: branch, tag, or commit SHA. 'HEAD' floats with
-  # upstream master — which already changed our binary's DLL imports between
-  # two runs on the same day (736 -> 743 build targets, new unresolvable
-  # import). For reproducible tag releases, set this to the last green
-  # commit; every run prints 'audio.cpp HEAD: <sha>' to the log for exactly
-  # that purpose.
+  # Pin the audio.cpp source for reproducible releases: branch, tag, or commit
+  # SHA. Upstream master is NOT safe to float on — it introduced a static
+  # nvcuda.dll (NVIDIA driver) import on 2026-09-21 between two of our runs,
+  # producing an exe that cannot start without an NVIDIA driver. Set this to
+  # the last green commit (every run prints 'audio.cpp HEAD: <sha>'); use the
+  # 'audiocpp_ref' dispatch input to test candidate SHAs without editing.
   AUDIOCPP_REF: 'HEAD'
 
 jobs:
@@ -164,12 +173,16 @@ jobs:
             $llamafile = "ON"
           }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
-          if ($env:AUDIOCPP_REF -and $env:AUDIOCPP_REF -ne "HEAD") {
-            git -C audio-cpp fetch --depth 1 origin "$env:AUDIOCPP_REF"
+          # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          $audioRef = "${{ inputs.audiocpp_ref }}"
+          if ([string]::IsNullOrEmpty($audioRef)) { $audioRef = "$env:AUDIOCPP_REF" }
+          if ($audioRef -and $audioRef -ne "HEAD") {
+            git -C audio-cpp fetch --depth 1 origin "$audioRef"
             git -C audio-cpp checkout FETCH_HEAD
           }
-          "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
+          "audio.cpp ref: $audioRef"
+          "audio.cpp HEAD: $audioHead"
           # NOTE: do not put '#' comment lines inside the backtick-continued
           # cmake call below. PowerShell ends the statement at the comment, so
           # the next '-D...' line then runs as its own command and fails with
@@ -255,24 +268,28 @@ jobs:
             }
           }
           # ---- Resolve the exe's full static-import closure and bundle it ----
-          # 0xC0000135 means the loader could not find (a dependency of) one of
-          # the exe's imports. Every CUDA toolkit DLL dir is on PATH here, so a
-          # missing import is never a plain toolkit DLL — it is something
-          # vendored in the build tree, or a driver/third-party DLL the runner
-          # does not have. We walk the import graph (exe -> DLLs -> their DLLs)
-          # with dumpbin, resolve every import against the real loader search
-          # order PLUS the build tree and the Vulkan SDK, copy every non-system
-          # hit into bin\, and NAME anything unresolvable instead of failing
-          # with a bare NTSTATUS. Delay-load imports are bundled when found but
-          # only warn when missing (they are not needed to start the process).
+          # Walk the import graph (exe -> DLLs -> their DLLs) with dumpbin,
+          # resolve every import against the real loader search order PLUS
+          # the build tree and the Vulkan SDK, copy every non-system hit into
+          # bin\, and NAME anything unresolvable instead of failing with a
+          # bare NTSTATUS. Special classes (see file header):
+          #   * api-ms-win-* / ext-ms-win-*: OS-resolved API-set contracts —
+          #     skipped entirely. (MSVC's Llvm\bin contains real stub FILES
+          #     for some of them; bundling those into the zip would be wrong.)
+          #   * nvcuda.dll / nvml.dll / nvapi64.dll: NVIDIA-driver-only DLLs —
+          #     never bundled; a STATIC import hard-fails by name with the
+          #     offending audio.cpp HEAD. Delay-loaded driver DLLs are fine
+          #     and only note their absence.
           $binDir = "$PWD\bin"
           if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
             $searchDirs = @($binDir, "$env:SystemRoot\System32", "$env:SystemRoot")
             $searchDirs += @($env:PATH -split ';' | Where-Object { $_ })
             $searchDirs += @(Get-ChildItem -Recurse -Path build/windows-all-release -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DirectoryName -Unique)
             $searchDirs += @(Get-ChildItem -Recurse -Path "C:\VulkanSDK\${env:VULKAN_VERSION}" -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DirectoryName -Unique)
+            $driverDlls = @("nvcuda.dll", "nvml.dll", "nvapi64.dll")
             $seen = @{}
             $missing = @()
+            $driverMissing = @()
             $queue = @("$binDir\audiocpp_cli.exe")
             for ($round = 0; $round -lt 6 -and $queue.Count -gt 0; $round++) {
               $next = @()
@@ -286,6 +303,16 @@ jobs:
                   $key = $dep.ToLowerInvariant()
                   if ($seen.ContainsKey($key)) { continue }
                   $seen[$key] = $true
+                  if ($dep -match '^(api|ext)-ms-win-') { continue }
+                  if ($driverDlls -contains $key) {
+                    if ($mode -eq 2) {
+                      "  DRIVER-DLL  $dep  statically imported by $(Split-Path $f -Leaf) — NVIDIA-driver-only, never bundleable"
+                      $driverMissing += $dep
+                    } else {
+                      "  delay-loaded driver DLL (acceptable): $dep"
+                    }
+                    continue
+                  }
                   $hit = $null
                   foreach ($d in $searchDirs) {
                     if (-not $d) { continue }
@@ -308,10 +335,17 @@ jobs:
               $queue = $next
             }
             "audiocpp_cli import closure: $(($seen.Keys | Sort-Object) -join ', ')"
+            if ($driverMissing.Count -gt 0) {
+              throw ("audio.cpp HEAD $audioHead statically imports NVIDIA driver DLL(s): $($driverMissing -join ', '). " +
+                     "These ship ONLY with the NVIDIA display driver — the exe would refuse to start on every machine " +
+                     "without an NVIDIA GPU (this runner and all CPU/Vulkan-only users). Upstream must load the driver " +
+                     "API dynamically (LoadLibrary/delay-load), or pin AUDIOCPP_REF / the audiocpp_ref dispatch input " +
+                     "to the last commit before this change.")
+            }
             if ($missing.Count -gt 0) {
               throw ("Unresolvable DLL import(s): $($missing -join ', ') — not in bin\, the build tree, System32 or PATH. " +
-                     "If this is a driver/third-party DLL (nvml.dll / cuDNN / codec / ...), audio.cpp must vendor it or load it " +
-                     "dynamically (upstream issue), or pin env AUDIOCPP_REF to the last green audio.cpp commit.")
+                     "If this is a third-party DLL (cuDNN / codec / ...), audio.cpp must vendor it or load it dynamically " +
+                     "(upstream issue), or pin AUDIOCPP_REF to the last green audio.cpp commit.")
             }
           } else {
             "dumpbin not on PATH; skipping import-closure resolution (smoke test still runs)"
@@ -492,11 +526,14 @@ jobs:
           CUDA_ARCH_ARGS=()
           if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
-          if [ -n "${AUDIOCPP_REF:-}" ] && [ "${AUDIOCPP_REF}" != "HEAD" ]; then
-            git -C audio-cpp fetch --depth 1 origin "${AUDIOCPP_REF}"
+          # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          AUDIO_REF="${{ inputs.audiocpp_ref }}"
+          if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
+          if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
+            git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
             git -C audio-cpp checkout FETCH_HEAD
           fi
+          echo "audio.cpp ref: ${AUDIO_REF}"
           echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
@@ -556,18 +593,35 @@ jobs:
           # ---- Full shared-library closure check (mirror of the Windows
           # import-table resolver): ldd names anything the loader cannot
           # resolve. Missing libs are auto-bundled from the build tree or the
-          # CUDA toolkit when possible; anything still missing is NAMED in the
-          # error instead of failing with an opaque loader message.
+          # CUDA toolkit when possible; anything still missing is NAMED in
+          # the error instead of failing with an opaque loader message.
+          # Driver-provided libs (libcuda.so.1 / libnvidia-ml.so.1) ship only
+          # with the NVIDIA driver — a static dependency on one is an UPSTREAM
+          # regression (the binary cannot run on driverless machines like this
+          # runner), so they get their own hard-fail. The toolkit's
+          # stubs/libcuda.so is link-only and must never be bundled (-not -path
+          # '*/stubs/*' below).
+          DRIVER_LIBS="libcuda.so libcuda.so.1 libnvidia-ml.so.1"
+          DRIVER_MISSING=""
           MISSING_LIBS=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
           if [ -n "$MISSING_LIBS" ]; then
             for lib in $MISSING_LIBS; do
-              found=$(find build/linux-all-release "${CUDA_PATH:-/usr/local/cuda}" -name "$lib" 2>/dev/null | head -n 1 || true)
+              case " $DRIVER_LIBS " in
+                *" $lib "*) DRIVER_MISSING="$DRIVER_MISSING $lib"; continue ;;
+              esac
+              found=$(find build/linux-all-release "${CUDA_PATH:-/usr/local/cuda}" -name "$lib" -not -path "*/stubs/*" 2>/dev/null | head -n 1 || true)
               if [ -n "$found" ]; then
                 cp -L "$found" "bin/$lib"
                 patchelf --set-rpath '$ORIGIN' "bin/$lib" || true
                 echo "bundled $lib <- $found"
               fi
             done
+          fi
+          if [ -n "$DRIVER_MISSING" ]; then
+            echo "::error::audio.cpp statically links NVIDIA driver library(ies):${DRIVER_MISSING}"
+            echo "These ship only with the NVIDIA driver — the binary cannot run on machines without one (like this runner)."
+            echo "Fix upstream (dlopen the driver library) or pin AUDIOCPP_REF / the audiocpp_ref dispatch input to the last green commit."
+            exit 1
           fi
           STILL_MISSING=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
           if [ -n "$STILL_MISSING" ]; then
@@ -699,11 +753,14 @@ jobs:
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
-          if [ -n "${AUDIOCPP_REF:-}" ] && [ "${AUDIOCPP_REF}" != "HEAD" ]; then
-            git -C audio-cpp fetch --depth 1 origin "${AUDIOCPP_REF}"
+          # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          AUDIO_REF="${{ inputs.audiocpp_ref }}"
+          if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
+          if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
+            git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
             git -C audio-cpp checkout FETCH_HEAD
           fi
+          echo "audio.cpp ref: ${AUDIO_REF}"
           echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
           cd audio-cpp
           ./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
