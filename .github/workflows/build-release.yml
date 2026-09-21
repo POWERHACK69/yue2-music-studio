@@ -14,6 +14,12 @@ name: Build & Release Yue2 Studio Standalone App
 # (cudart/cublas/cublasLt/cufft/nvJitLink). ggml links these dynamically and
 # cuBLAS has no static variant, so without them the shipped app cannot use
 # CUDA on machines without a toolkit (and may not start at all).
+#
+# Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
+# application level (nothing to enumerate). That is tolerated. What is NOT
+# tolerated: the binary failing to start — NTSTATUS codes on Windows
+# (negative $LASTEXITCODE, e.g. 0xC0000135 missing DLL) and loader errors /
+# signal deaths on Linux (exit 127 / >=128).
 
 on:
   push:
@@ -205,7 +211,7 @@ jobs:
           Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName bin\ -Force }
           # CUDA runtime DLLs (always dynamic) from the toolkit. nvjitlink is
           # required by cuBLAS/cuFFT in CUDA 12.x — forgetting it is the
-          # classic "missing nvjitlink_128_0.dll" failure on clean machines.
+          # classic "missing nvJitLink_120_0.dll" failure on clean machines.
           foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
             if (Test-Path $d) {
               foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "nvjitlink*.dll")) {
@@ -242,8 +248,32 @@ jobs:
           }
           if (-not $cudaLinked) { throw "CUDA backend was not linked into the build" }
           Get-ChildItem bin
-          # Prove all three backends compiled in (informational: no GPU on runner).
-          .\bin\audiocpp_cli.exe --list-devices
+          # Smoke test (informational: no GPU on the runner). What must hold:
+          # the exe STARTS and every DLL import resolves. Packaging breakage
+          # shows up as NTSTATUS exit codes — NEGATIVE in $LASTEXITCODE
+          # (e.g. 0xC0000135 'DLL not found' = -1073741515, 0xC000001D
+          # 'illegal instruction'). A plain exit 1 from --list-devices is an
+          # app-level "nothing to list without a GPU" result and is tolerated,
+          # mirroring the Linux job. CUDA presence is already proven by the
+          # linkage assertion above. NOTE: the trailing 'exit 0' matters —
+          # GitHub's pwsh shell propagates $LASTEXITCODE of the last native
+          # command as the step result.
+          & .\bin\audiocpp_cli.exe --list-devices
+          $smoke = $LASTEXITCODE
+          "audiocpp_cli --list-devices exit code: $smoke"
+          if ($smoke -lt 0) {
+            throw ("audiocpp_cli.exe did not start cleanly (NTSTATUS 0x{0:X8}) — missing DLL or bad build" -f ($smoke -band 0xFFFFFFFF))
+          }
+          if ($smoke -ne 0) {
+            "non-zero app exit code tolerated on this GPU-less runner; showing --help instead:"
+            & .\bin\audiocpp_cli.exe --help 2>&1 | ForEach-Object { "$_" } | Select-Object -First 40
+            $help = $LASTEXITCODE
+            "audiocpp_cli --help exit code: $help"
+            if ($help -lt 0) {
+              throw ("audiocpp_cli.exe --help also failed to start (NTSTATUS 0x{0:X8})" -f ($help -band 0xFFFFFFFF))
+            }
+          }
+          exit 0
 
       - name: Verify 64-bit binary (Windows x64)
         shell: pwsh
@@ -431,8 +461,22 @@ jobs:
             exit 1
           fi
           ls -la bin
-          # Prove all three backends compiled in (informational: no GPU on runner).
-          ./bin/audiocpp_cli --list-devices || ./bin/audiocpp_cli --help | head -n 40
+          # Smoke test (informational: no GPU on the runner). A non-zero
+          # --list-devices exit is an app-level result (nothing to list
+          # without a GPU) and is tolerated — but loader errors (127) and
+          # signal deaths (>=128, e.g. SIGILL 132 / SIGSEGV 139) mean the
+          # binary itself is broken and must fail the build.
+          rc=0
+          ./bin/audiocpp_cli --list-devices || rc=$?
+          echo "audiocpp_cli --list-devices exit code: $rc"
+          if [ "$rc" -ge 126 ]; then
+            echo "::error::audiocpp_cli did not run cleanly (exit $rc: 126/127 = loader error, >=128 = killed by signal)"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo "non-zero app exit code tolerated on this GPU-less runner; showing --help instead:"
+            ./bin/audiocpp_cli --help 2>&1 | head -n 40 || true
+          fi
 
       - name: Verify 64-bit binary (Linux x86_64)
         shell: bash
