@@ -34,9 +34,10 @@ on:
         options: [avx2, baseline]
         default: avx2
       cuda_arch:
-        description: 'CUDA arch list (empty = trimmed default in env.CUDA_ARCHES)'
-        type: string
-        default: ''
+        description: 'CUDA GPU coverage (wider = slower build)'
+        type: choice
+        options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
+        default: 'rtx3040'
       appimage:
         description: 'Build Linux AppImage'
         type: boolean
@@ -52,13 +53,14 @@ env:
   CUDA_VERSION_WINDOWS: '12.8.1'
   CUDA_VERSION_LINUX: '12.8.1'
   VULKAN_VERSION: '1.4.357.0'
-  # Trimmed CUDA arch list (biggest CI time saver). Upstream portable default on
+  # Default CUDA coverage (biggest CI time saver). Upstream portable default on
   # CUDA 12.8 compiles every .cu 9x (50/61/70-virtual + 75-real + 80-virtual +
-  # 86-real + 89-real + 90-virtual + 120a-real). This drops Maxwell/Pascal/Volta
-  # PTX (GTX 9xx/10xx fall back to CPU/Vulkan) and keeps Turing→Blackwell SASS
-  # plus 90-virtual PTX for forward-compat JIT. Matches README's "RTX 20+"
-  # support floor. Override per-run via workflow_dispatch `cuda_arch` if needed.
-  CUDA_ARCHES: '75-real;80-virtual;86-real;89-real;90-virtual;120a-real'
+  # 86-real + 89-real + 90-virtual + 120a-real). Presets (see cuda_arch input):
+  # rtx3040=86;89 (RTX 30/40, ~2/9 nvcc work) | rtx203040=+75 (RTX 20/GTX 16)
+  # gtx10plus=+61 (GTX 10xx) | legacy=+52 (GTX 9xx) | wide=trimmed 6-arch
+  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
+  # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
+  CUDA_ARCHES: '86;89'
 
 jobs:
   # ================= Windows: CPU + CUDA + Vulkan =================
@@ -150,8 +152,22 @@ jobs:
           # moves to VS18 again. Harmless on a supported compiler.
           $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
           # Semicolons must stay quoted — bare ';' is a PowerShell statement separator.
-          $cudaArches = "${{ inputs.cuda_arch }}"
-          if ([string]::IsNullOrEmpty($cudaArches)) { $cudaArches = $env:CUDA_ARCHES }
+          # Named presets from the cuda_arch picker; 'full' omits the flag and
+          # lets upstream use its 9-arch default. default{} keeps raw arch
+          # lists working (env default + forward compat).
+          $cudaPreset = "${{ inputs.cuda_arch }}"
+          if ([string]::IsNullOrEmpty($cudaPreset)) { $cudaPreset = $env:CUDA_ARCHES }
+          $cudaArches = switch ($cudaPreset) {
+            "rtx3040"   { "86;89" }
+            "rtx203040" { "75;86;89" }
+            "gtx10plus" { "61;75;86;89" }
+            "legacy"    { "52;61;75;86;89" }
+            "wide"      { "75-real;80-virtual;86-real;89-real;90-virtual;120a-real" }
+            "full"      { "full" }
+            default     { $cudaPreset }
+          }
+          $cudaArchFlag = @()
+          if (-not [string]::IsNullOrEmpty($cudaArches) -and $cudaArches -ne "full") { $cudaArchFlag = @("-DCMAKE_CUDA_ARCHITECTURES=$cudaArches") }
           cmake -S audio-cpp -B build/windows-all-release -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_FLAGS=/utf-8 "-DCMAKE_CXX_FLAGS=/utf-8 /EHsc" `
@@ -163,7 +179,7 @@ jobs:
             @isa `
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
-            "-DCMAKE_CUDA_ARCHITECTURES=$cudaArches" `
+            @cudaArchFlag `
             -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
             "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
@@ -300,10 +316,24 @@ jobs:
           # only one GPU backend, upstream CMake allows CUDA+Vulkan together.
           # --native-cpu OFF equivalent = portable kernels (no -march=native →
           # no AVX-512-only binary that dies with SIGILL on older CPUs).
-          # Trimmed CUDA arches (see env.CUDA_ARCHES): 6 entries instead of the
-          # 9-arch portable default. Each .cu compiles Nx, so this is ~1/3 less
-          # nvcc work. Pass `cuda_arch` input to override for a full-compat build.
-          if [ -n "${{ inputs.cuda_arch }}" ]; then CUDA_ARCHES="${{ inputs.cuda_arch }}"; fi
+          # CUDA coverage presets from the cuda_arch picker (default '86;89'):
+          # each .cu compiles Nx. 'full' omits the flag and restores the
+          # 9-arch portable default. The *) branch keeps raw arch lists working.
+          CUDA_PRESET="${{ inputs.cuda_arch }}"
+          if [ -z "$CUDA_PRESET" ]; then CUDA_PRESET="$CUDA_ARCHES"; fi
+          case "$CUDA_PRESET" in
+            "rtx3040") CUDA_ARCHES="86;89" ;;
+            "rtx203040") CUDA_ARCHES="75;86;89" ;;
+            "gtx10plus") CUDA_ARCHES="61;75;86;89" ;;
+            "legacy") CUDA_ARCHES="52;61;75;86;89" ;;
+            "wide") CUDA_ARCHES="75-real;80-virtual;86-real;89-real;90-virtual;120a-real" ;;
+            "full") CUDA_ARCHES="full" ;;
+            *) CUDA_ARCHES="$CUDA_PRESET" ;;
+          esac
+          # Array (not a plain string): ';' must never be unquoted in bash,
+          # and a quoted-empty string would reach cmake as a bogus empty arg.
+          CUDA_ARCH_ARGS=()
+          if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
@@ -320,7 +350,7 @@ jobs:
             -DENGINE_ENABLE_LLAMAFILE=ON \
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 \
-            "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"
+            "${CUDA_ARCH_ARGS[@]}"
           cmake --build build/linux-all-release --parallel "$(nproc)" --target audiocpp_cli
           ccache -s || true
           mkdir -p bin
