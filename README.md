@@ -147,7 +147,9 @@ Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App*
   only for very old CPUs. Never ship `native` builds publicly.
 - CUDA builds for RTX 30/40 by default for fast CI — widen coverage in the
   Run workflow picker (`cuda_arch`: `rtx203040`, `gtx10plus`, `legacy` for
-  GTX 9xx-era, `wide`, or `full`) when you need older/newer cards (NOT local-GPU auto-detect),
+  GTX 9xx-era, `wide`, or `full`), or pick `nocuda` for a CPU+Vulkan-only
+  build with no toolkit/nvcc (fastest; select `--backend cpu/vulkan` manually
+  since `auto` still prefers CUDA when `nvidia-smi` exists) (NOT local-GPU auto-detect),
   bundles the CUDA runtime DLLs on Windows, and still runs `--backend cpu` when
   no NVIDIA GPU is present. Vulkan needs a Vulkan 1.1+ driver (AMD/NVIDIA/Intel).
 - If `pygame` cannot initialise audio (headless CI), the GUI still runs and logs

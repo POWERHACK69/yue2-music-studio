@@ -98,12 +98,16 @@ VAE_CHOICES = [
     "yue2-vae-f32.gguf (Full / ~531MB)",
 ]
 
+# NOTE: the Hub reports decimal units (1 GB = 1e9 bytes): q4_0 is exactly
+# 2,665,632,320 bytes ("2.67 GB"). A 1024**3 multiplier here overshoots by
+# ~7.5%, which put every complete download under the 95% truncation gate in
+# check_model_files and reported it "missing or truncated". Keep decimal.
 APPROX_SIZES = {
-    "yue2-3b-q4_0.gguf": int(2.67 * 1024**3),
-    "yue2-3b-q8_0.gguf": int(4.26 * 1024**3),
-    "yue2-3b-bf16.gguf": int(7.26 * 1024**3),
-    "yue2-vae-f16.gguf": 265 * 1024**2,
-    "yue2-vae-f32.gguf": 531 * 1024**2,
+    "yue2-3b-q4_0.gguf": int(2.67 * 1000**3),
+    "yue2-3b-q8_0.gguf": int(4.26 * 1000**3),
+    "yue2-3b-bf16.gguf": int(7.26 * 1000**3),
+    "yue2-vae-f16.gguf": 265 * 1000**2,
+    "yue2-vae-f32.gguf": 531 * 1000**2,
 }
 
 # Known Windows NTSTATUS crashes mapped to actionable advice.
