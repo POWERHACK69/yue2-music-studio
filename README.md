@@ -145,7 +145,8 @@ Or: GitHub repo → **Actions** → *Build & Release Yue2 Studio Standalone App*
 - CPU kernels are portable by default (`-CpuArch avx2` balance on Windows /
   `--native-cpu OFF` elsewhere: no AVX-512-only instructions). Pick `baseline`
   only for very old CPUs. Never ship `native` builds publicly.
-- CUDA uses audio.cpp's portable multi-arch default (NOT local-GPU auto-detect),
+- CUDA uses a trimmed arch list (`75-real;80-virtual;86-real;89-real;90-virtual;120a-real`,
+  Turing→Blackwell, override via `cuda_arch` input — NOT local-GPU auto-detect),
   bundles the CUDA runtime DLLs on Windows, and still runs `--backend cpu` when
   no NVIDIA GPU is present. Vulkan needs a Vulkan 1.1+ driver (AMD/NVIDIA/Intel).
 - If `pygame` cannot initialise audio (headless CI), the GUI still runs and logs
