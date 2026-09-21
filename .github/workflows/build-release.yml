@@ -53,7 +53,10 @@ jobs:
   # ================= Windows: CPU + CUDA + Vulkan =================
   windows:
     name: Windows x64 (CPU+CUDA+Vulkan)
-    runs-on: windows-latest
+    # Pinned: windows-latest now ships VS18 (MSVC 19.51, VS 2026) which CUDA 12.8's
+    # nvcc rejects in host_config.h (fatal C1189, only VS 2017-2022 allowed).
+    # Upstream audio.cpp builds on windows-2022, so stay here.
+    runs-on: windows-2022
     if: github.event_name != 'workflow_dispatch' || inputs.windows
     steps:
       - name: Checkout repository
@@ -114,6 +117,17 @@ jobs:
             $llamafile = "ON"
           }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # NOTE: do not put '#' comment lines inside the backtick-continued
+          # cmake call below. PowerShell ends the statement at the comment, so
+          # the next '-D...' line then runs as its own command and fails with
+          # "The term '-DCUDAToolkit_ROOT=...' is not recognized".
+          # Keep this cmake invocation comment-free.
+          # VS compat: runner is pinned to windows-2022 (VS17/VS 2022, supported
+          # by CUDA 12.8). NVCC_PREPEND_FLAGS is belt-and-braces: unlike
+          # -DCMAKE_CUDA_FLAGS it also covers CMake's CUDA compiler-id check
+          # (CMakeCUDACompilerId.cu), so the build survives if the image ever
+          # moves to VS18 again. Harmless on a supported compiler.
+          $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
           cmake -S audio-cpp -B build/windows-all-release -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_FLAGS=/utf-8 "-DCMAKE_CXX_FLAGS=/utf-8 /EHsc" `
@@ -125,13 +139,8 @@ jobs:
             @isa `
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
-          # -allow-unsupported-compiler: windows-latest runners now ship Visual
-          # Studio 18, which CUDA 12.8's nvcc gates in host_config.h (fatal
-          # C1189, only VS 2017-2022 allowed) — upstream builds on
-          # windows-2022 so never hits this. This is nvcc's own suggested
-          # override; VS minor-version bumps are normally harmless here.
-          -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
-          "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
+            -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
+            "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
             throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
           }
