@@ -15,6 +15,12 @@ name: Build & Release Yue2 Studio Standalone App
 # cuBLAS has no static variant, so without them the shipped app cannot use
 # CUDA on machines without a toolkit (and may not start at all).
 #
+# DLL/DSO closure: the Windows job walks the exe's full static-import graph
+# with dumpbin and bundles every non-system DLL it can locate (build tree,
+# CUDA toolkit, Vulkan SDK, PATH); the Linux job does the same via ldd.
+# Anything unresolvable is NAMED in the error instead of a bare
+# 0xC0000135 / loader message.
+#
 # Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
 # application level (nothing to enumerate). That is tolerated. What is NOT
 # tolerated: the binary failing to start — NTSTATUS codes on Windows
@@ -72,6 +78,13 @@ env:
   # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
   # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
+  # Pin the audio.cpp source: branch, tag, or commit SHA. 'HEAD' floats with
+  # upstream master — which already changed our binary's DLL imports between
+  # two runs on the same day (736 -> 743 build targets, new unresolvable
+  # import). For reproducible tag releases, set this to the last green
+  # commit; every run prints 'audio.cpp HEAD: <sha>' to the log for exactly
+  # that purpose.
+  AUDIOCPP_REF: 'HEAD'
 
 jobs:
   # ================= Windows: CPU + CUDA + Vulkan =================
@@ -151,6 +164,12 @@ jobs:
             $llamafile = "ON"
           }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
+          if ($env:AUDIOCPP_REF -and $env:AUDIOCPP_REF -ne "HEAD") {
+            git -C audio-cpp fetch --depth 1 origin "$env:AUDIOCPP_REF"
+            git -C audio-cpp checkout FETCH_HEAD
+          }
+          "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
           # NOTE: do not put '#' comment lines inside the backtick-continued
           # cmake call below. PowerShell ends the statement at the comment, so
           # the next '-D...' line then runs as its own command and fails with
@@ -235,6 +254,86 @@ jobs:
               }
             }
           }
+          # ---- Resolve the exe's full static-import closure and bundle it ----
+          # 0xC0000135 means the loader could not find (a dependency of) one of
+          # the exe's imports. Every CUDA toolkit DLL dir is on PATH here, so a
+          # missing import is never a plain toolkit DLL — it is something
+          # vendored in the build tree, or a driver/third-party DLL the runner
+          # does not have. We walk the import graph (exe -> DLLs -> their DLLs)
+          # with dumpbin, resolve every import against the real loader search
+          # order PLUS the build tree and the Vulkan SDK, copy every non-system
+          # hit into bin\, and NAME anything unresolvable instead of failing
+          # with a bare NTSTATUS. Delay-load imports are bundled when found but
+          # only warn when missing (they are not needed to start the process).
+          $binDir = "$PWD\bin"
+          if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+            $searchDirs = @($binDir, "$env:SystemRoot\System32", "$env:SystemRoot")
+            $searchDirs += @($env:PATH -split ';' | Where-Object { $_ })
+            $searchDirs += @(Get-ChildItem -Recurse -Path build/windows-all-release -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DirectoryName -Unique)
+            $searchDirs += @(Get-ChildItem -Recurse -Path "C:\VulkanSDK\${env:VULKAN_VERSION}" -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DirectoryName -Unique)
+            $seen = @{}
+            $missing = @()
+            $queue = @("$binDir\audiocpp_cli.exe")
+            for ($round = 0; $round -lt 6 -and $queue.Count -gt 0; $round++) {
+              $next = @()
+              foreach ($f in $queue) {
+                $mode = 0
+                foreach ($line in (& dumpbin /dependents $f 2>$null)) {
+                  if ($line -match 'delay load dependencies') { $mode = 1; continue }
+                  if ($line -match 'has the following dependencies') { $mode = 2; continue }
+                  if ($mode -eq 0 -or $line -notmatch '^\s+([A-Za-z0-9_\-.]+\.dll)\s*$') { continue }
+                  $dep = $Matches[1]
+                  $key = $dep.ToLowerInvariant()
+                  if ($seen.ContainsKey($key)) { continue }
+                  $seen[$key] = $true
+                  $hit = $null
+                  foreach ($d in $searchDirs) {
+                    if (-not $d) { continue }
+                    $p = Join-Path $d $dep
+                    if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) { $hit = $p; break }
+                  }
+                  if (-not $hit) {
+                    if ($mode -eq 1) { "  delay-load not present on this machine (not fatal): $dep" }
+                    else { "  MISSING  $dep  (imported by $(Split-Path $f -Leaf))"; $missing += $dep }
+                    continue
+                  }
+                  if ($hit -like "$env:SystemRoot\*") { continue }
+                  if (-not $hit.StartsWith("$binDir\", [StringComparison]::OrdinalIgnoreCase)) {
+                    Copy-Item -LiteralPath $hit -Destination $binDir -Force
+                    "  bundled  $dep  <- $hit"
+                  }
+                  $next += (Join-Path $binDir $dep)
+                }
+              }
+              $queue = $next
+            }
+            "audiocpp_cli import closure: $(($seen.Keys | Sort-Object) -join ', ')"
+            if ($missing.Count -gt 0) {
+              throw ("Unresolvable DLL import(s): $($missing -join ', ') — not in bin\, the build tree, System32 or PATH. " +
+                     "If this is a driver/third-party DLL (nvml.dll / cuDNN / codec / ...), audio.cpp must vendor it or load it " +
+                     "dynamically (upstream issue), or pin env AUDIOCPP_REF to the last green audio.cpp commit.")
+            }
+          } else {
+            "dumpbin not on PATH; skipping import-closure resolution (smoke test still runs)"
+          }
+          # The Vulkan loader ships with GPU drivers but NOT on every Windows
+          # machine — bundle the redistributable loader so CPU-only machines
+          # can still start the app (ggml-vulkan imports vulkan-1.dll).
+          if (-not (Test-Path -LiteralPath "$binDir\vulkan-1.dll")) {
+            if (Test-Path -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll") {
+              Copy-Item -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll" -Destination $binDir -Force
+              "  bundled  vulkan-1.dll <- System32"
+            }
+          }
+          # App-local VC runtime + OpenMP fallback: the vswhere redist lookup
+          # finds nothing on this runner image, and System32 holds the
+          # redist-installed copies of exactly these redistributable DLLs.
+          foreach ($rt in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "vcomp140.dll")) {
+            $src = "$env:SystemRoot\System32\$rt"
+            if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath "$binDir\$rt")) {
+              Copy-Item -LiteralPath $src -Destination $binDir -Force
+            }
+          }
           # Hard-fail if CUDA silently did not make it into the build (renamed
           # upstream flag, failed toolkit detection, ...). A CUDA-enabled build
           # either imports the CUDA runtime DLLs in the exe, produces a shared
@@ -262,7 +361,7 @@ jobs:
           $smoke = $LASTEXITCODE
           "audiocpp_cli --list-devices exit code: $smoke"
           if ($smoke -lt 0) {
-            throw ("audiocpp_cli.exe did not start cleanly (NTSTATUS 0x{0:X8}) — missing DLL or bad build" -f ($smoke -band 0xFFFFFFFF))
+            throw ("audiocpp_cli.exe did not start cleanly (NTSTATUS 0x{0:X8}) — see the import-closure output above" -f ($smoke -band 0xFFFFFFFF))
           }
           if ($smoke -ne 0) {
             "non-zero app exit code tolerated on this GPU-less runner; showing --help instead:"
@@ -393,6 +492,12 @@ jobs:
           CUDA_ARCH_ARGS=()
           if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
+          if [ -n "${AUDIOCPP_REF:-}" ] && [ "${AUDIOCPP_REF}" != "HEAD" ]; then
+            git -C audio-cpp fetch --depth 1 origin "${AUDIOCPP_REF}"
+            git -C audio-cpp checkout FETCH_HEAD
+          fi
+          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
           export CCACHE_MAXSIZE="2G"
@@ -448,6 +553,28 @@ jobs:
           for so in bin/*.so*; do
             if [ -f "$so" ]; then patchelf --set-rpath '$ORIGIN' "$so"; fi
           done
+          # ---- Full shared-library closure check (mirror of the Windows
+          # import-table resolver): ldd names anything the loader cannot
+          # resolve. Missing libs are auto-bundled from the build tree or the
+          # CUDA toolkit when possible; anything still missing is NAMED in the
+          # error instead of failing with an opaque loader message.
+          MISSING_LIBS=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
+          if [ -n "$MISSING_LIBS" ]; then
+            for lib in $MISSING_LIBS; do
+              found=$(find build/linux-all-release "${CUDA_PATH:-/usr/local/cuda}" -name "$lib" 2>/dev/null | head -n 1 || true)
+              if [ -n "$found" ]; then
+                cp -L "$found" "bin/$lib"
+                patchelf --set-rpath '$ORIGIN' "bin/$lib" || true
+                echo "bundled $lib <- $found"
+              fi
+            done
+          fi
+          STILL_MISSING=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
+          if [ -n "$STILL_MISSING" ]; then
+            echo "::error::unresolved shared-library dependencies: ${STILL_MISSING}"
+            echo "Not in the build tree or CUDA toolkit — audio.cpp must vendor it, or pin AUDIOCPP_REF to the last green commit."
+            exit 1
+          fi
           # Hard-fail if CUDA silently did not make it into the build (renamed
           # upstream flag, failed toolkit detection, ...). Signals: the exe
           # links the CUDA runtime, a shared ggml-cuda backend exists, or
@@ -572,6 +699,12 @@ jobs:
         run: |
           set -euxo pipefail
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # Optional pin (see env.AUDIOCPP_REF): branch, tag, or commit SHA.
+          if [ -n "${AUDIOCPP_REF:-}" ] && [ "${AUDIOCPP_REF}" != "HEAD" ]; then
+            git -C audio-cpp fetch --depth 1 origin "${AUDIOCPP_REF}"
+            git -C audio-cpp checkout FETCH_HEAD
+          fi
+          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
           cd audio-cpp
           ./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
           mkdir -p ../bin
