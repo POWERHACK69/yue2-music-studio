@@ -3,34 +3,34 @@ name: Build & Release Yue2 Studio Standalone App
 # One artifact per OS, each with every backend compiled in:
 #   Windows: CPU + CUDA + Vulkan | Linux: CPU + CUDA + Vulkan | macOS: CPU + Metal
 # The in-app backend dropdown (auto/cuda/cpu/vulkan/metal) selects at RUNTIME.
-# Upstream audio.cpp CMake allows CUDA+Vulkan together (only CUDA+HIP is
-# forbidden); its helper scripts just package them separately. Here we
-# configure CMake directly to get a single all-backend binary. Models are
-# never bundled — they download on first run (~2.6GB q4_0 / ~4.2GB q8_0).
+# Upstream audio.cpp CMake allows CUDA+Vulkan together; we configure CMake
+# directly for a single all-backend binary. Models are never bundled.
 #
-# NVIDIA-driver-only symbols: nvcuda.dll / nvml.dll / nvapi64.dll (Win) and
-# libcuda.so.1 / libnvidia-ml.so.1 (Linux) ship ONLY with the display driver.
-# The CUDA driver API (cuDeviceGet, cuMemAddressReserve, ...) resolves only
-# against them. Layers guarding this:
-#   1. GGML_CUDA_NO_VMM=ON — disables ggml's own driver-API (VMM) path.
-#   2. Pre-flight (all OS jobs): refuse any audio.cpp state whose OWN code
-#      calls cuXxx directly outside ggml/external. Windows could delay-load
-#      such an import, but ELF cannot — a linked libcuda.so.1 is a hard
-#      DT_NEEDED that refuses to start on driverless machines. The pre-flight
-#      walks --first-parent back to the last ancestor without such calls
-#      (git grep only, no compiling) and prints the effective SHA.
-#   3. /DELAYLOAD:nvcuda.dll delayimp.lib (Windows) — any future upstream
-#      import degrades to a first-call load instead of a startup failure.
-#   4. The import-closure (dumpbin) / ldd guards still hard-fail by name if a
-#      driver DLL/DSO ever lands in the static import table.
-#   5. CUDA runtime (cudart/cublas/cublasLt/cufft/nvJitLink) IS redistributable
-#      and IS bundled next to the CLI in both CUDA jobs.
+# NVIDIA-driver-only linkage: upstream's attention probe (engine/
+# attention_fallback.cpp) calls the CUDA driver API directly (cuDeviceGet,
+# cuDeviceGetAttribute, ...), which resolves ONLY against nvcuda.dll /
+# libcuda.so.1 — and upstream's CMake linkage for those calls and the calls
+# themselves landed in separate commits (parent links broken; the fix commit
+# imports the driver DLL statically). Layers that keep our builds shippable:
+#   1. GGML_CUDA_NO_VMM=ON      — ggml's own driver-API (VMM) path disabled.
+#   2. CUDA driver-API shim     — a small object linked into the CLI that
+#      DEFINES the driver-API symbols the engine calls and resolves them at
+#      runtime via LoadLibraryW("nvcuda.dll") / dlopen("libcuda.so.1").
+#      Driver present -> forwards (probe works). Driver absent -> returns
+#      CUDA_ERROR_NO_DEVICE (engine's non-CUDA fallback path). No static
+#      import on Windows, no DT_NEEDED on Linux. If upstream ever adds MORE
+#      driver symbols, the link error names them — add one more forwarding
+#      function to the shim in the build step.
+#   3. /DELAYLOAD:nvcuda.dll (Windows, belt-and-braces) — if a future upstream
+#      state links nvcuda.lib anyway, its import degrades to a first-call
+#      load. Harmless LNK4199 when unused.
+#   4. Import-closure (dumpbin) / ldd guards still hard-fail any STATIC
+#      driver DLL/DSO dependency by name.
+#   5. audio.cpp pinned via env.AUDIOCPP_REF (branch/tag/SHA/'SHA~N').
 #
-# Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
-# application level (nothing to enumerate). That is tolerated. What is NOT
-# tolerated: the binary failing to start — NTSTATUS codes on Windows
-# (negative $LASTEXITCODE, e.g. 0xC0000135 missing DLL) and loader errors /
-# signal deaths on Linux (exit 127 / >=128).
+# Smoke tests: --list-devices on a GPU-less runner may exit non-zero at the
+# application level (tolerated). Startup failures are NOT tolerated:
+# negative $LASTEXITCODE (NTSTATUS) on Windows; exit 127 / >=128 on Linux.
 
 on:
   push:
@@ -61,7 +61,7 @@ on:
         options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
         default: 'rtx3040'
       audiocpp_ref:
-        description: 'audio.cpp ref override (branch/tag/SHA/SHA~N) — pre-flight walks back to the last driver-API-free ancestor; overrides env.AUDIOCPP_REF'
+        description: 'audio.cpp ref override (branch/tag/SHA/SHA~N) — overrides env.AUDIOCPP_REF for this run only'
         type: string
         default: ''
       appimage:
@@ -79,24 +79,18 @@ env:
   CUDA_VERSION_LINUX: '12.8.1'
   VULKAN_VERSION: '1.4.357.0'
   CUDA_ARCHES: '86;89'
-  # Pinned audio.cpp source: branch, tag, commit SHA, or '<SHA>~<N>'. The
-  # 2026-09-21 window around 779714db0872cc7351d69baeaafb8bd5cf47fac7 added
-  # direct CUDA-driver-API calls (cuDeviceGet/cuDeviceGetAttribute) in
-  # attention_fallback.cpp; its CMake linkage and the calls landed in separate
-  # commits, so '~1' links-broken (undefined cuDeviceGet) while the commit
-  # itself links with a static nvcuda.dll import — neither is shippable. The
-  # build steps' pre-flight walks --first-parent back to the nearest ancestor
-  # with NO direct driver-API calls outside ggml and prints
-  # 'audio.cpp HEAD (effective)'. After a green run, replace this with that
-  # literal SHA. Test candidates via the audiocpp_ref dispatch input.
+  # Pinned audio.cpp source. 779714db (2026-09-21) made the exe statically
+  # import nvcuda.dll; its parent (~1) has the attention-probe's driver-API
+  # calls without the driver-lib linkage (undefined cuDeviceGet). The jobs
+  # link a runtime-loaded shim for those calls (see file header), so ~1
+  # builds cleanly AND starts on driverless machines. After each green run,
+  # bake the printed 'audio.cpp HEAD (effective)' literal SHA in here.
   AUDIOCPP_REF: '779714db0872cc7351d69baeaafb8bd5cf47fac7~1'
 
 jobs:
   # ================= Windows: CPU + CUDA + Vulkan =================
   windows:
     name: Windows x64 (CPU+CUDA+Vulkan)
-    # Pinned: windows-latest now ships VS18 (MSVC 19.51, VS 2026) which CUDA 12.8's
-    # nvcc rejects in host_config.h (fatal C1189, only VS 2017-2022 allowed).
     runs-on: windows-2022
     if: github.event_name != 'workflow_dispatch' || inputs.windows
     steps:
@@ -142,7 +136,7 @@ jobs:
         shell: pwsh
         run: |
           # Direct CMake: helper scripts force a single GPU backend; upstream
-          # CMake itself only forbids CUDA+HIP, so CUDA+Vulkan configure fine.
+          # CMake itself only forbids CUDA+HIP.
           $arch = "${{ inputs.cpu_arch }}"
           if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
           if ($arch -eq "baseline") {
@@ -152,64 +146,105 @@ jobs:
             $isa = @("-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AV_VNNI=ON")
             $llamafile = "ON"
           }
-          # depth 30: history headroom for the pre-flight walk-back below.
-          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
-          # Supported refs: branch/tag, plain SHA, or '<SHA>~<N>'. '~' cannot
-          # be resolved server-side, so fetch enough history and resolve
-          # locally.
+          # Supported refs: branch/tag, plain SHA, or '<SHA>~<N>' (resolved
+          # locally with enough fetch depth).
           $audioRef = "${{ inputs.audiocpp_ref }}"
           if ([string]::IsNullOrEmpty($audioRef)) { $audioRef = "$env:AUDIOCPP_REF" }
           if ($audioRef -and $audioRef -ne "HEAD") {
             if ($audioRef -match '^([0-9a-fA-F]{6,40})~(\d+)$') {
               $baseSha = $Matches[1]; $back = [int]$Matches[2]
-              if ($back -gt 28) { throw "audio.cpp pin '~$back' exceeds the 30-commit fetch depth" }
-              git -C audio-cpp fetch --depth 30 origin "$baseSha"
+              git -C audio-cpp fetch --depth ($back + 2) origin "$baseSha"
               $pinSha = "$(git -C audio-cpp rev-parse "$baseSha~$back")"
-              if ([string]::IsNullOrEmpty($pinSha)) { throw "could not resolve audio.cpp pin '$audioRef' (is $baseSha reachable upstream?)" }
+              if ([string]::IsNullOrEmpty($pinSha)) { throw "could not resolve audio.cpp pin '$audioRef'" }
               git -C audio-cpp checkout $pinSha
               if ($LASTEXITCODE -ne 0) { throw "git checkout of audio.cpp pin '$pinSha' failed" }
             } else {
-              git -C audio-cpp fetch --depth 30 origin "$audioRef"
+              git -C audio-cpp fetch --depth 1 origin "$audioRef"
               git -C audio-cpp checkout FETCH_HEAD
             }
           }
-          $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
           "audio.cpp ref: $audioRef"
-          "audio.cpp HEAD: $audioHead"
-          # ---- Pre-flight: never build a state that calls the CUDA driver API ----
-          # attention_fallback.cpp (engine_runtime) calls cuDeviceGet /
-          # cuDeviceGetAttribute. Those symbols come ONLY from the driver
-          # import lib (nvcuda.lib / libcuda.so stub): Windows could delay-load
-          # it, but on Linux a linked driver lib is a DT_NEEDED that refuses to
-          # start on driverless machines. The only shippable state is one with
-          # no direct cuXxx calls outside ggml (ggml's VMM path is off via
-          # GGML_CUDA_NO_VMM=ON). Upstream's calls and their CMake linkage
-          # landed in separate commits, so pins can land on unbuildable
-          # intermediates — walk --first-parent back to the last ancestor
-          # without them. git grep only; ~seconds. The regex requires '('
-          # right after the symbol, so dlsym-style strings ("cuDeviceGet")
-          # and cublas*/cudart* names (lowercase after 'cu') do NOT match.
-          $apiRe = '(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
-          $gspec = @('--', '*.cpp', '*.cc', '*.c', '*.h', '*.hpp', '*.cu', '*.cuh',
-                     ':(exclude)ggml', ':(exclude)external', ':(exclude)third_party',
-                     ':(exclude)examples', ':(exclude)tests')
-          $cleanSha = $null
-          foreach ($sha in @(git -C audio-cpp rev-list --first-parent -n 30 HEAD)) {
-            $hits = @(git -C audio-cpp grep -E "$apiRe" "$sha" @gspec 2>$null)
-            if ($hits.Count -eq 0) { $cleanSha = $sha; break }
-            "  pre-flight: $sha calls the CUDA driver API directly (e.g. $($hits[0])) — not shippable; stepping back"
+          "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          # ---- CUDA driver-API shim (see file header) ----
+          # The engine's attention probe calls cuDeviceGet/cuDeviceGetAttribute
+          # directly. Upstream's parent commit lacks the driver-lib linkage and
+          # the fix commit imports nvcuda.dll statically. This shim DEFINES the
+          # symbols and resolves them via LoadLibraryW at runtime -> links with
+          # no driver import at all. Extend drvSym list if a future ref adds
+          # more driver symbols (the link error names them).
+          $shimDir = "$PWD\ci-shim"
+          New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+          @'
+          // CUDA driver-API shim: defines the cu* symbols audio.cpp's engine
+          // calls directly and forwards them to nvcuda.dll / libcuda.so.1
+          // loaded at runtime. Without a driver, stubs return
+          // CUDA_ERROR_NO_DEVICE so the engine falls back gracefully.
+          #include <cstddef>
+          #if defined(_WIN32)
+            #define WIN32_LEAN_AND_MEAN
+            #include <windows.h>
+          #else
+            #include <dlfcn.h>
+          #endif
+          extern "C" {
+          typedef unsigned int CUdevice;
+          typedef int CUresult;
+          enum { CUDA_SUCCESS = 0, CUDA_ERROR_NO_DEVICE = 100 };
+          static void* g_drvLib = 0;
+          static bool  g_drvTried = false;
+          static void* drvLib() {
+            if (!g_drvTried) {
+              g_drvTried = true;
+          #if defined(_WIN32)
+              g_drvLib = (void*)LoadLibraryW(L"nvcuda.dll");
+          #else
+              g_drvLib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+              if (!g_drvLib) g_drvLib = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+          #endif
+            }
+            return g_drvLib;
           }
-          if (-not $cleanSha) {
-            throw "no audio.cpp ancestor within 30 commits of $audioHead is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF (see 'audio.cpp HEAD:' in the last green run)"
+          static void* drvSym(const char* name) {
+            void* lib = drvLib();
+            if (!lib) return 0;
+          #if defined(_WIN32)
+            return (void*)GetProcAddress((HMODULE)lib, name);
+          #else
+            return dlsym(lib, name);
+          #endif
           }
-          if ($cleanSha -ne "$(git -C audio-cpp rev-parse HEAD)") {
-            git -C audio-cpp checkout $cleanSha
-            if ($LASTEXITCODE -ne 0) { throw "git checkout of pre-flight ancestor $cleanSha failed" }
-            "::warning::audio.cpp $audioHead calls the CUDA driver API directly (upstream link-break / driver-only import); building last clean ancestor $cleanSha instead. Set AUDIOCPP_REF to that SHA for reproducible releases."
+          typedef CUresult (*cuInit_t)(unsigned int);
+          typedef CUresult (*cuDeviceGetCount_t)(int*);
+          typedef CUresult (*cuDeviceGet_t)(CUdevice*, int);
+          typedef CUresult (*cuDeviceGetName_t)(char*, int, CUdevice);
+          typedef CUresult (*cuDeviceTotalMem_t)(size_t*, CUdevice);
+          typedef CUresult (*cuDeviceGetAttribute_t)(int*, int, CUdevice);
+          CUresult cuInit(unsigned int flags) {
+            cuInit_t f = (cuInit_t)drvSym("cuInit"); return f ? f(flags) : CUDA_ERROR_NO_DEVICE;
           }
-          $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
-          "audio.cpp HEAD (effective): $audioHead"
+          CUresult cuDeviceGetCount(int* count) {
+            cuDeviceGetCount_t f = (cuDeviceGetCount_t)drvSym("cuDeviceGetCount"); return f ? f(count) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGet(CUdevice* device, int ordinal) {
+            cuDeviceGet_t f = (cuDeviceGet_t)drvSym("cuDeviceGet"); return f ? f(device, ordinal) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetName(char* name, int len, CUdevice dev) {
+            cuDeviceGetName_t f = (cuDeviceGetName_t)drvSym("cuDeviceGetName"); return f ? f(name, len, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
+            cuDeviceTotalMem_t f = (cuDeviceTotalMem_t)drvSym("cuDeviceTotalMem"); return f ? f(bytes, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetAttribute(int* value, int attribute, CUdevice dev) {
+            cuDeviceGetAttribute_t f = (cuDeviceGetAttribute_t)drvSym("cuDeviceGetAttribute"); return f ? f(value, attribute, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          } // extern "C"
+          '@ | Set-Content -LiteralPath "$shimDir\cuda_driver_shim.cpp"
+          cl /nologo /c /O2 /EHsc /utf-8 "$shimDir\cuda_driver_shim.cpp" /Fo"$shimDir\cuda_driver_shim.obj"
+          if ($LASTEXITCODE -ne 0) { throw "CUDA driver-API shim failed to compile" }
+          $shimObj = ((Get-Location).Path + "\ci-shim\cuda_driver_shim.obj") -replace '\\', '/'
+          "shim object: $shimObj"
           # NOTE: do not put '#' comment lines inside the backtick-continued
           # cmake call below. Keep this cmake invocation comment-free.
           $env:NVCC_PREPEND_OPTIONS = "-allow-unsupported-compiler"
@@ -240,12 +275,15 @@ jobs:
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
             @cudaArchFlag `
             -DGGML_CUDA_NO_VMM=ON `
-            "-DCMAKE_EXE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:nvcuda.dll delayimp.lib" `
+            "-DCMAKE_EXE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:nvcuda.dll delayimp.lib $shimObj" `
             "-DCMAKE_SHARED_LINKER_FLAGS=/machine:x64 /DELAYLOAD:nvcuda.dll delayimp.lib" `
             -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
             "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
             throw "OpenMP was requested but ggml did not configure GGML_OPENMP_ENABLED=ON."
+          }
+          if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "cuda_driver_shim" -Quiet)) {
+            throw "CUDA driver-API shim object is missing from CMAKE_EXE_LINKER_FLAGS."
           }
           $jobs = [Math]::Max(2, [Environment]::ProcessorCount)
           cmake --build build/windows-all-release -j $jobs --target audiocpp_cli
@@ -254,8 +292,6 @@ jobs:
           if (-not $cli) { throw "audiocpp_cli.exe not found after build" }
           Copy-Item $cli.FullName bin\audiocpp_cli.exe
           Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName bin\ -Force }
-          # CUDA runtime DLLs (always dynamic) from the toolkit. nvjitlink is
-          # required by cuBLAS/cuFFT in CUDA 12.x.
           foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
             if (Test-Path $d) {
               foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "nvjitlink*.dll")) {
@@ -263,7 +299,6 @@ jobs:
               }
             }
           }
-          # MSVC + OpenMP runtime DLLs (vswhere discovery, any VS2022 edition).
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           if (Test-Path $vswhere) {
             $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -280,9 +315,10 @@ jobs:
             }
           }
           # ---- Resolve the exe's full static-import closure and bundle it ----
-          # (delay-loaded driver DLLs are fine and only noted; STATIC ones
-          # hard-fail by name — see file header. With the pre-flight above and
-          # /DELAYLOAD in place, nvcuda should never appear statically.)
+          # api-ms-win-* / ext-ms-win-*: OS-resolved, skipped. nvcuda/nvml/
+          # nvapi64: NVIDIA-driver-only; a STATIC import hard-fails by name
+          # (delay-loaded ones only note their absence). With the shim linked,
+          # nvcuda should not appear at all.
           $binDir = "$PWD\bin"
           if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
             $searchDirs = @($binDir, "$env:SystemRoot\System32", "$env:SystemRoot")
@@ -339,33 +375,28 @@ jobs:
             }
             "audiocpp_cli import closure: $(($seen.Keys | Sort-Object) -join ', ')"
             if ($driverMissing.Count -gt 0) {
-              throw ("audio.cpp HEAD $audioHead statically imports NVIDIA driver DLL(s): $($driverMissing -join ', '). " +
-                     "These ship ONLY with the NVIDIA display driver — the exe would refuse to start on every machine " +
-                     "without an NVIDIA GPU. Upstream must load the driver API dynamically (LoadLibrary/delay-load), " +
-                     "or pin AUDIOCPP_REF to the last commit before this change.")
+              throw ("audio.cpp HEAD $(git -C audio-cpp rev-parse HEAD) statically imports NVIDIA driver DLL(s): $($driverMissing -join ', '). " +
+                     "These ship ONLY with the NVIDIA display driver. Upstream must load the driver API dynamically " +
+                     "(the ci-shim does this for the probe) or pin AUDIOCPP_REF.")
             }
             if ($missing.Count -gt 0) {
-              throw ("Unresolvable DLL import(s): $($missing -join ', ') — not in bin\, the build tree, System32 or PATH. " +
-                     "If this is a third-party DLL, audio.cpp must vendor it or load it dynamically, or pin AUDIOCPP_REF.")
+              throw ("Unresolvable DLL import(s): $($missing -join ', ') — not in bin\, the build tree, System32 or PATH.")
             }
           } else {
             "dumpbin not on PATH; skipping import-closure resolution (smoke test still runs)"
           }
-          # Bundle the redistributable Vulkan loader (ggml-vulkan imports it).
           if (-not (Test-Path -LiteralPath "$binDir\vulkan-1.dll")) {
             if (Test-Path -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll") {
               Copy-Item -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll" -Destination $binDir -Force
               "  bundled  vulkan-1.dll <- System32"
             }
           }
-          # App-local VC runtime + OpenMP fallback from System32.
           foreach ($rt in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "vcomp140.dll")) {
             $src = "$env:SystemRoot\System32\$rt"
             if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath "$binDir\$rt")) {
               Copy-Item -LiteralPath $src -Destination $binDir -Force
             }
           }
-          # Hard-fail if CUDA silently did not make it into the build.
           $cudaLinked = $false
           if (Get-ChildItem -Recurse -Path build/windows-all-release -Filter "*cuda*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1) { $cudaLinked = $true }
           if (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_CUDA:BOOL=ON$" -Quiet) { $cudaLinked = $true }
@@ -381,13 +412,12 @@ jobs:
           $smoke = $LASTEXITCODE
           "audiocpp_cli --list-devices exit code: $smoke"
           if ($smoke -lt 0) {
-            throw ("audiocpp_cli.exe did not start cleanly (NTSTATUS 0x{0:X8}) — see the import-closure output above" -f ($smoke -band 0xFFFFFFFF))
+            throw ("audiocpp_cli.exe did not start cleanly (NTSTATUS 0x{0:X8})" -f ($smoke -band 0xFFFFFFFF))
           }
           if ($smoke -ne 0) {
             "non-zero app exit code tolerated on this GPU-less runner; showing --help instead:"
             & .\bin\audiocpp_cli.exe --help 2>&1 | ForEach-Object { "$_" } | Select-Object -First 40
             $help = $LASTEXITCODE
-            "audiocpp_cli --help exit code: $help"
             if ($help -lt 0) {
               throw ("audiocpp_cli.exe --help also failed to start (NTSTATUS 0x{0:X8})" -f ($help -band 0xFFFFFFFF))
             }
@@ -487,52 +517,97 @@ jobs:
           esac
           CUDA_ARCH_ARGS=()
           if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
-          # depth 30: history headroom for the pre-flight walk-back below.
-          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
             if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
               BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
-              if [ "$BACK" -gt 28 ]; then echo "::error::pin '~${BACK}' exceeds the 30-commit fetch depth"; exit 1; fi
-              git -C audio-cpp fetch --depth 30 origin "$BASE_SHA"
+              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
               PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
               git -C audio-cpp checkout "$PIN_SHA"
             else
-              git -C audio-cpp fetch --depth 30 origin "${AUDIO_REF}"
+              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
               git -C audio-cpp checkout FETCH_HEAD
             fi
           fi
-          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
           echo "audio.cpp ref: ${AUDIO_REF}"
-          echo "audio.cpp HEAD: ${AUDIO_HEAD}"
-          # ---- Pre-flight: never build a state that calls the CUDA driver API ----
-          # (rationale in the Windows job: cuDeviceGet & co. resolve only
-          # against the NVIDIA driver import lib; ELF has no delay-load, so a
-          # linked libcuda.so.1 is a startup-failing DT_NEEDED on driverless
-          # machines. Walk --first-parent to the last ancestor whose own code
-          # has no direct cuXxx calls outside ggml. git grep only, ~seconds.)
-          API_RE='(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
-          GSPEC=(-- '*.cpp' '*.cc' '*.c' '*.h' '*.hpp' '*.cu' '*.cuh'
-                 ':(exclude)ggml' ':(exclude)external' ':(exclude)third_party'
-                 ':(exclude)examples' ':(exclude)tests')
-          CLEAN_SHA=""
-          for sha in $(git -C audio-cpp rev-list --first-parent -n 30 HEAD); do
-            HITS="$(git -C audio-cpp grep -E "$API_RE" "$sha" "${GSPEC[@]}" 2>/dev/null || true)"
-            if [ -z "$HITS" ]; then CLEAN_SHA="$sha"; break; fi
-            echo "  pre-flight: $sha calls the CUDA driver API directly — not shippable; stepping back"
-          done
-          if [ -z "$CLEAN_SHA" ]; then
-            echo "::error::no audio.cpp ancestor within 30 commits of ${AUDIO_HEAD} is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF"
-            exit 1
-          fi
-          if [ "$CLEAN_SHA" != "$(git -C audio-cpp rev-parse HEAD)" ]; then
-            git -C audio-cpp checkout "$CLEAN_SHA"
-            echo "::warning::audio.cpp ${AUDIO_HEAD} calls the CUDA driver API directly (upstream link-break / driver-only import); building last clean ancestor ${CLEAN_SHA} instead. Set AUDIOCPP_REF to that SHA for reproducible releases."
-          fi
-          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
-          echo "audio.cpp HEAD (effective): ${AUDIO_HEAD}"
+          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          # ---- CUDA driver-API shim (see Windows job / file header) ----
+          # Compiled to a plain .o appended to CMAKE_EXE_LINKER_FLAGS; object
+          # files are unconditional link inputs, so its definitions satisfy
+          # engine_runtime's cuDeviceGet/cuDeviceGetAttribute references with
+          # NO libcuda.so.1 DT_NEEDED (which the ldd guard would reject and
+          # which would refuse to start on driverless machines).
+          mkdir -p ci-shim
+          cat > ci-shim/cuda_driver_shim.cpp <<'EOF'
+          // CUDA driver-API shim: defines the cu* symbols audio.cpp's engine
+          // calls directly and forwards them to libcuda.so.1 / nvcuda.dll
+          // loaded at runtime. Without a driver, stubs return
+          // CUDA_ERROR_NO_DEVICE so the engine falls back gracefully.
+          #include <cstddef>
+          #if defined(_WIN32)
+            #define WIN32_LEAN_AND_MEAN
+            #include <windows.h>
+          #else
+            #include <dlfcn.h>
+          #endif
+          extern "C" {
+          typedef unsigned int CUdevice;
+          typedef int CUresult;
+          enum { CUDA_SUCCESS = 0, CUDA_ERROR_NO_DEVICE = 100 };
+          static void* g_drvLib = 0;
+          static bool  g_drvTried = false;
+          static void* drvLib() {
+            if (!g_drvTried) {
+              g_drvTried = true;
+          #if defined(_WIN32)
+              g_drvLib = (void*)LoadLibraryW(L"nvcuda.dll");
+          #else
+              g_drvLib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+              if (!g_drvLib) g_drvLib = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+          #endif
+            }
+            return g_drvLib;
+          }
+          static void* drvSym(const char* name) {
+            void* lib = drvLib();
+            if (!lib) return 0;
+          #if defined(_WIN32)
+            return (void*)GetProcAddress((HMODULE)lib, name);
+          #else
+            return dlsym(lib, name);
+          #endif
+          }
+          typedef CUresult (*cuInit_t)(unsigned int);
+          typedef CUresult (*cuDeviceGetCount_t)(int*);
+          typedef CUresult (*cuDeviceGet_t)(CUdevice*, int);
+          typedef CUresult (*cuDeviceGetName_t)(char*, int, CUdevice);
+          typedef CUresult (*cuDeviceTotalMem_t)(size_t*, CUdevice);
+          typedef CUresult (*cuDeviceGetAttribute_t)(int*, int, CUdevice);
+          CUresult cuInit(unsigned int flags) {
+            cuInit_t f = (cuInit_t)drvSym("cuInit"); return f ? f(flags) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetCount(int* count) {
+            cuDeviceGetCount_t f = (cuDeviceGetCount_t)drvSym("cuDeviceGetCount"); return f ? f(count) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGet(CUdevice* device, int ordinal) {
+            cuDeviceGet_t f = (cuDeviceGet_t)drvSym("cuDeviceGet"); return f ? f(device, ordinal) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetName(char* name, int len, CUdevice dev) {
+            cuDeviceGetName_t f = (cuDeviceGetName_t)drvSym("cuDeviceGetName"); return f ? f(name, len, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
+            cuDeviceTotalMem_t f = (cuDeviceTotalMem_t)drvSym("cuDeviceTotalMem"); return f ? f(bytes, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetAttribute(int* value, int attribute, CUdevice dev) {
+            cuDeviceGetAttribute_t f = (cuDeviceGetAttribute_t)drvSym("cuDeviceGetAttribute"); return f ? f(value, attribute, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          } // extern "C"
+          EOF
+          g++-13 -c -O2 -fPIC ci-shim/cuda_driver_shim.cpp -o ci-shim/cuda_driver_shim.o
+          SHIM_OBJ="$PWD/ci-shim/cuda_driver_shim.o"
+          echo "shim object: ${SHIM_OBJ}"
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
           export CCACHE_MAXSIZE="2G"
@@ -548,7 +623,11 @@ jobs:
             -DGGML_CUDA_NO_VMM=ON \
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 \
+            "-DCMAKE_EXE_LINKER_FLAGS=${SHIM_OBJ}" \
             "${CUDA_ARCH_ARGS[@]}"
+          grep -q "cuda_driver_shim" build/linux-all-release/CMakeCache.txt || {
+            echo "::error::CUDA driver-API shim object is missing from CMAKE_EXE_LINKER_FLAGS"; exit 1;
+          }
           cmake --build build/linux-all-release --parallel "$(nproc)" --target audiocpp_cli
           ccache -s || true
           mkdir -p bin
@@ -576,6 +655,7 @@ jobs:
             if [ -f "$so" ]; then patchelf --set-rpath '$ORIGIN' "$so"; fi
           done
           # ---- ldd closure check; driver libs hard-fail by name ----
+          # With the shim linked there must be NO libcuda.so.1 dependency.
           DRIVER_LIBS="libcuda.so libcuda.so.1 libnvidia-ml.so.1"
           DRIVER_MISSING=""
           MISSING_LIBS=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
@@ -601,7 +681,6 @@ jobs:
           STILL_MISSING=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
           if [ -n "$STILL_MISSING" ]; then
             echo "::error::unresolved shared-library dependencies: ${STILL_MISSING}"
-            echo "Not in the build tree or CUDA toolkit — audio.cpp must vendor it, or pin AUDIOCPP_REF."
             exit 1
           fi
           # Hard-fail if CUDA silently did not make it into the build.
@@ -614,7 +693,6 @@ jobs:
             exit 1
           fi
           ls -la bin
-          # Smoke test (informational: no GPU on the runner).
           rc=0
           ./bin/audiocpp_cli --list-devices || rc=$?
           echo "audiocpp_cli --list-devices exit code: $rc"
@@ -718,49 +796,65 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Same pin + pre-flight as the other OS jobs so all three artifacts
-          # ship the SAME audio.cpp source state.
-          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
             if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
               BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
-              if [ "$BACK" -gt 28 ]; then echo "::error::pin '~${BACK}' exceeds the 30-commit fetch depth"; exit 1; fi
-              git -C audio-cpp fetch --depth 30 origin "$BASE_SHA"
+              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
               PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
               git -C audio-cpp checkout "$PIN_SHA"
             else
-              git -C audio-cpp fetch --depth 30 origin "${AUDIO_REF}"
+              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
               git -C audio-cpp checkout FETCH_HEAD
             fi
           fi
-          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
           echo "audio.cpp ref: ${AUDIO_REF}"
-          echo "audio.cpp HEAD: ${AUDIO_HEAD}"
-          # Pre-flight (same rule as Windows/Linux — keeps the three OS
-          # artifacts on one upstream SHA even though Metal never links CUDA).
-          API_RE='(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
-          GSPEC=(-- '*.cpp' '*.cc' '*.c' '*.h' '*.hpp' '*.cu' '*.cuh'
-                 ':(exclude)ggml' ':(exclude)external' ':(exclude)third_party'
-                 ':(exclude)examples' ':(exclude)tests')
-          CLEAN_SHA=""
-          for sha in $(git -C audio-cpp rev-list --first-parent -n 30 HEAD); do
-            HITS="$(git -C audio-cpp grep -E "$API_RE" "$sha" "${GSPEC[@]}" 2>/dev/null || true)"
-            if [ -z "$HITS" ]; then CLEAN_SHA="$sha"; break; fi
-            echo "  pre-flight: $sha calls the CUDA driver API directly — stepping back for cross-OS pin consistency"
-          done
-          if [ -z "$CLEAN_SHA" ]; then
-            echo "::error::no audio.cpp ancestor within 30 commits of ${AUDIO_HEAD} is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF"
-            exit 1
-          fi
-          if [ "$CLEAN_SHA" != "$(git -C audio-cpp rev-parse HEAD)" ]; then
-            git -C audio-cpp checkout "$CLEAN_SHA"
-            echo "::warning::audio.cpp ${AUDIO_HEAD} calls the CUDA driver API directly; building last clean ancestor ${CLEAN_SHA} for cross-OS pin consistency."
-          fi
-          echo "audio.cpp HEAD (effective): $(git -C audio-cpp rev-parse HEAD)"
+          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          # Same CUDA driver-API shim as the CUDA jobs, injected via a one-line
+          # include() appended to audio.cpp's top-level CMakeLists (the Metal
+          # build goes through upstream's script, so flags can't be passed).
+          # Harmless if unused (a static-lib member nobody references is never
+          # pulled); required if the engine probe compiles in on Metal too.
+          mkdir -p ci-shim
+          cat > ci-shim/cuda_driver_shim.cpp <<'EOF'
+          #include <cstddef>
+          #include <dlfcn.h>
+          extern "C" {
+          typedef unsigned int CUdevice;
+          typedef int CUresult;
+          enum { CUDA_SUCCESS = 0, CUDA_ERROR_NO_DEVICE = 100 };
+          static void* g_drvLib = 0;
+          static bool  g_drvTried = false;
+          static void* drvLib() {
+            if (!g_drvTried) { g_drvTried = true; g_drvLib = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL); }
+            return g_drvLib;
+          }
+          static void* drvSym(const char* name) {
+            void* lib = drvLib();
+            return lib ? dlsym(lib, name) : 0;
+          }
+          typedef CUresult (*cuDeviceGet_t)(CUdevice*, int);
+          typedef CUresult (*cuDeviceGetAttribute_t)(int*, int, CUdevice);
+          CUresult cuDeviceGet(CUdevice* device, int ordinal) {
+            cuDeviceGet_t f = (cuDeviceGet_t)drvSym("cuDeviceGet"); return f ? f(device, ordinal) : CUDA_ERROR_NO_DEVICE;
+          }
+          CUresult cuDeviceGetAttribute(int* value, int attribute, CUdevice dev) {
+            cuDeviceGetAttribute_t f = (cuDeviceGetAttribute_t)drvSym("cuDeviceGetAttribute"); return f ? f(value, attribute, dev) : CUDA_ERROR_NO_DEVICE;
+          }
+          } // extern "C"
+          EOF
+          cat > ci-shim/ci_cuda_shim.cmake <<'EOF'
+          set(CI_SHIM_SRC "${CMAKE_CURRENT_LIST_DIR}/cuda_driver_shim.cpp")
+          add_library(cu_driver_shim STATIC "${CI_SHIM_SRC}")
+          cmake_language(DEFER CALL target_link_libraries(audiocpp_cli PRIVATE cu_driver_shim))
+          file(WRITE "${CMAKE_BINARY_DIR}/ci_shim_injected.marker" "ok")
+          EOF
+          printf '\ninclude(%s)\n' "$PWD/ci-shim/ci_cuda_shim.cmake" >> audio-cpp/CMakeLists.txt
           cd audio-cpp
           ./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
+          find . -name ci_shim_injected.marker | grep -q . || echo "::warning::shim include may not have run (no marker found) — check the link if it fails on cu* symbols"
           mkdir -p ../bin
           CLI_BIN=$(find build -type f -name audiocpp_cli | head -n 1)
           if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
@@ -796,7 +890,6 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [windows, linux, macos]
-    # Not 'always()': a failed OS build must NOT publish a partial release.
     if: >-
       ${{ !cancelled()
           && needs.windows.result != 'failure'
