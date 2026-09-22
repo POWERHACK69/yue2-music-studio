@@ -25,6 +25,13 @@ name: Build & Release Yue2 Studio Standalone App
 #     libnvidia-ml.so.1 (Linux) ship ONLY with the NVIDIA display driver. A
 #     static import of one means the binary cannot start on machines without
 #     an NVIDIA driver — an upstream regression, hard-failed by name.
+#     Mitigations layered on top (see env.AUDIOCPP_REF and the build steps):
+#       - GGML_CUDA_NO_VMM=ON removes the usual source of the import (ggml's
+#         VMM pool calls the CUDA driver API directly),
+#       - /DELAYLOAD:nvcuda.dll + delayimp.lib (Windows) turns any residual
+#         driver import into a first-call load, so the exe still starts on
+#         machines without an NVIDIA driver and only fails if a driver API
+#         is actually invoked (which the GPU-less smoke test would catch).
 #
 # Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
 # application level (nothing to enumerate). That is tolerated. What is NOT
@@ -61,7 +68,7 @@ on:
         options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
         default: 'rtx3040'
       audiocpp_ref:
-        description: 'audio.cpp ref override (branch/tag/SHA) — overrides env.AUDIOCPP_REF for this run only'
+        description: 'audio.cpp ref override (branch/tag/SHA/SHA~N) — overrides env.AUDIOCPP_REF for this run only'
         type: string
         default: ''
       appimage:
@@ -87,13 +94,18 @@ env:
   # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
   # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
-  # Pin the audio.cpp source for reproducible releases: branch, tag, or commit
-  # SHA. Upstream master is NOT safe to float on — it introduced a static
-  # nvcuda.dll (NVIDIA driver) import on 2026-09-21 between two of our runs,
-  # producing an exe that cannot start without an NVIDIA driver. Set this to
-  # the last green commit (every run prints 'audio.cpp HEAD: <sha>'); use the
-  # 'audiocpp_ref' dispatch input to test candidate SHAs without editing.
-  AUDIOCPP_REF: 'HEAD'
+  # Pinned audio.cpp source for reproducible releases: branch, tag, commit
+  # SHA, or '<SHA>~<N>' (the N-th ancestor of a commit). Upstream master is
+  # NOT safe to float on — commit 779714db0872cc7351d69baeaafb8bd5cf47fac7
+  # (2026-09-21) made the exe statically import nvcuda.dll, an NVIDIA-driver
+  # -only DLL, so the binary refused to start on machines without an NVIDIA
+  # GPU. The default below pins to that commit's PARENT (~1) — the last
+  # known-good state. The NO_VMM + /DELAYLOAD mitigations mean newer upstream
+  # commits that only ADD a driver-API import still build and start; validate
+  # a candidate ref with a workflow_dispatch run (audiocpp_ref input — every
+  # run prints 'audio.cpp HEAD: <sha>'), then replace this with that SHA (or
+  # 'HEAD' once upstream loads the driver API dynamically).
+  AUDIOCPP_REF: '779714db0872cc7351d69baeaafb8bd5cf47fac7~1'
 
 jobs:
   # ================= Windows: CPU + CUDA + Vulkan =================
@@ -174,11 +186,24 @@ jobs:
           }
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          # Supported refs: branch/tag, plain SHA, or '<SHA>~<N>' (N-th
+          # ancestor — the env default is the parent of the commit that
+          # introduced the static nvcuda.dll import). GitHub cannot resolve
+          # '~' server-side, so fetch enough depth and resolve locally.
           $audioRef = "${{ inputs.audiocpp_ref }}"
           if ([string]::IsNullOrEmpty($audioRef)) { $audioRef = "$env:AUDIOCPP_REF" }
           if ($audioRef -and $audioRef -ne "HEAD") {
-            git -C audio-cpp fetch --depth 1 origin "$audioRef"
-            git -C audio-cpp checkout FETCH_HEAD
+            if ($audioRef -match '^([0-9a-fA-F]{6,40})~(\d+)$') {
+              $baseSha = $Matches[1]; $back = [int]$Matches[2]
+              git -C audio-cpp fetch --depth ($back + 2) origin "$baseSha"
+              $pinSha = "$(git -C audio-cpp rev-parse "$baseSha~$back")"
+              if (-not $pinSha) { throw "could not resolve audio.cpp pin '$audioRef' (is $baseSha reachable upstream?)" }
+              git -C audio-cpp checkout $pinSha
+              if ($LASTEXITCODE -ne 0) { throw "git checkout of audio.cpp pin '$pinSha' failed" }
+            } else {
+              git -C audio-cpp fetch --depth 1 origin "$audioRef"
+              git -C audio-cpp checkout FETCH_HEAD
+            }
           }
           $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
           "audio.cpp ref: $audioRef"
@@ -228,6 +253,9 @@ jobs:
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON `
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 `
             @cudaArchFlag `
+            -DGGML_CUDA_NO_VMM=ON `
+            "-DCMAKE_EXE_LINKER_FLAGS=/machine:x64 /DELAYLOAD:nvcuda.dll delayimp.lib" `
+            "-DCMAKE_SHARED_LINKER_FLAGS=/machine:x64 /DELAYLOAD:nvcuda.dll delayimp.lib" `
             -DCUDAToolkit_ROOT="$env:CUDA_PATH" `
             "-DCMAKE_CUDA_FLAGS=-Xcompiler=/utf-8 -allow-unsupported-compiler"
           if (-not (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_OPENMP_ENABLED:INTERNAL=ON$" -Quiet)) {
@@ -279,7 +307,9 @@ jobs:
           #   * nvcuda.dll / nvml.dll / nvapi64.dll: NVIDIA-driver-only DLLs —
           #     never bundled; a STATIC import hard-fails by name with the
           #     offending audio.cpp HEAD. Delay-loaded driver DLLs are fine
-          #     and only note their absence.
+          #     and only note their absence — and because this build passes
+          #     /DELAYLOAD:nvcuda.dll, the exe's own nvcuda import lands in
+          #     the delay table, not the static one.
           $binDir = "$PWD\bin"
           if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
             $searchDirs = @($binDir, "$env:SystemRoot\System32", "$env:SystemRoot")
@@ -527,11 +557,19 @@ jobs:
           if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          # '<SHA>~<N>' (N-th ancestor) is resolved locally with enough depth.
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
-            git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
-            git -C audio-cpp checkout FETCH_HEAD
+            if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
+              BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
+              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
+              PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
+              git -C audio-cpp checkout "$PIN_SHA"
+            else
+              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
+              git -C audio-cpp checkout FETCH_HEAD
+            fi
           fi
           echo "audio.cpp ref: ${AUDIO_REF}"
           echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
@@ -548,6 +586,7 @@ jobs:
             -DENGINE_ENABLE_VULKAN=ON \
             -DENGINE_ENABLE_NATIVE_CPU=OFF \
             -DENGINE_ENABLE_LLAMAFILE=ON \
+            -DGGML_CUDA_NO_VMM=ON \
             -DAUDIOCPP_DEPLOYMENT_BUILD=ON \
             -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 \
             "${CUDA_ARCH_ARGS[@]}"
@@ -754,11 +793,19 @@ jobs:
           set -euxo pipefail
           git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
+          # '<SHA>~<N>' (N-th ancestor) is resolved locally with enough depth.
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
-            git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
-            git -C audio-cpp checkout FETCH_HEAD
+            if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
+              BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
+              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
+              PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
+              git -C audio-cpp checkout "$PIN_SHA"
+            else
+              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
+              git -C audio-cpp checkout FETCH_HEAD
+            fi
           fi
           echo "audio.cpp ref: ${AUDIO_REF}"
           echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
@@ -799,7 +846,14 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [windows, linux, macos]
-    if: always() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    # Not 'always()': a failed/cancelled OS build must NOT publish a partial
+    # release. 'skipped' jobs (dispatch toggles) are fine.
+    if: >-
+      ${{ !cancelled()
+          && needs.windows.result != 'failure'
+          && needs.linux.result != 'failure'
+          && needs.macos.result != 'failure'
+          && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
