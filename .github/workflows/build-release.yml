@@ -5,33 +5,26 @@ name: Build & Release Yue2 Studio Standalone App
 # The in-app backend dropdown (auto/cuda/cpu/vulkan/metal) selects at RUNTIME.
 # Upstream audio.cpp CMake allows CUDA+Vulkan together (only CUDA+HIP is
 # forbidden); its helper scripts just package them separately. Here we
-# configure CMake directly to get a single all-backend binary. All heavy
-# compilation happens in CI, so low-disk-space users never build locally.
-# Models are never bundled — they download on first run from inside the app
-# (~2.6GB q4_0 / ~4.2GB q8_0 / ~7.2GB bf16).
+# configure CMake directly to get a single all-backend binary. Models are
+# never bundled — they download on first run (~2.6GB q4_0 / ~4.2GB q8_0).
 #
-# CUDA packaging: both CUDA jobs bundle the CUDA runtime next to the CLI
-# (cudart/cublas/cublasLt/cufft/nvJitLink). ggml links these dynamically and
-# cuBLAS has no static variant, so without them the shipped app cannot use
-# CUDA on machines without a toolkit (and may not start at all).
-#
-# DLL/DSO closure: the Windows job walks the exe's full static-import graph
-# with dumpbin and bundles every non-system DLL it can locate (build tree,
-# CUDA toolkit, Vulkan SDK, PATH); the Linux job does the same via ldd.
-# Special classes:
-#   * api-ms-win-* / ext-ms-win-* are Windows API-set contracts resolved by
-#     the OS loader — skipped entirely (never bundled, never "missing").
-#   * nvcuda.dll / nvml.dll / nvapi64.dll (Win) and libcuda.so.1 /
-#     libnvidia-ml.so.1 (Linux) ship ONLY with the NVIDIA display driver. A
-#     static import of one means the binary cannot start on machines without
-#     an NVIDIA driver — an upstream regression, hard-failed by name.
-#     Mitigations layered on top (see env.AUDIOCPP_REF and the build steps):
-#       - GGML_CUDA_NO_VMM=ON removes the usual source of the import (ggml's
-#         VMM pool calls the CUDA driver API directly),
-#       - /DELAYLOAD:nvcuda.dll + delayimp.lib (Windows) turns any residual
-#         driver import into a first-call load, so the exe still starts on
-#         machines without an NVIDIA driver and only fails if a driver API
-#         is actually invoked (which the GPU-less smoke test would catch).
+# NVIDIA-driver-only symbols: nvcuda.dll / nvml.dll / nvapi64.dll (Win) and
+# libcuda.so.1 / libnvidia-ml.so.1 (Linux) ship ONLY with the display driver.
+# The CUDA driver API (cuDeviceGet, cuMemAddressReserve, ...) resolves only
+# against them. Layers guarding this:
+#   1. GGML_CUDA_NO_VMM=ON — disables ggml's own driver-API (VMM) path.
+#   2. Pre-flight (all OS jobs): refuse any audio.cpp state whose OWN code
+#      calls cuXxx directly outside ggml/external. Windows could delay-load
+#      such an import, but ELF cannot — a linked libcuda.so.1 is a hard
+#      DT_NEEDED that refuses to start on driverless machines. The pre-flight
+#      walks --first-parent back to the last ancestor without such calls
+#      (git grep only, no compiling) and prints the effective SHA.
+#   3. /DELAYLOAD:nvcuda.dll delayimp.lib (Windows) — any future upstream
+#      import degrades to a first-call load instead of a startup failure.
+#   4. The import-closure (dumpbin) / ldd guards still hard-fail by name if a
+#      driver DLL/DSO ever lands in the static import table.
+#   5. CUDA runtime (cudart/cublas/cublasLt/cufft/nvJitLink) IS redistributable
+#      and IS bundled next to the CLI in both CUDA jobs.
 #
 # Smoke tests: --list-devices on a GPU-less CI runner may exit non-zero at the
 # application level (nothing to enumerate). That is tolerated. What is NOT
@@ -68,7 +61,7 @@ on:
         options: ['rtx3040', 'rtx203040', 'gtx10plus', 'legacy', 'wide', 'full']
         default: 'rtx3040'
       audiocpp_ref:
-        description: 'audio.cpp ref override (branch/tag/SHA/SHA~N) — overrides env.AUDIOCPP_REF for this run only'
+        description: 'audio.cpp ref override (branch/tag/SHA/SHA~N) — pre-flight walks back to the last driver-API-free ancestor; overrides env.AUDIOCPP_REF'
         type: string
         default: ''
       appimage:
@@ -82,29 +75,20 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  # Pinned toolchain versions (mirrors upstream audio.cpp release.yml).
   CUDA_VERSION_WINDOWS: '12.8.1'
   CUDA_VERSION_LINUX: '12.8.1'
   VULKAN_VERSION: '1.4.357.0'
-  # Default CUDA coverage (biggest CI time saver). Upstream portable default on
-  # CUDA 12.8 compiles every .cu 9x (50/61/70-virtual + 75-real + 80-virtual +
-  # 86-real + 89-real + 90-virtual + 120a-real). Presets (see cuda_arch input):
-  # rtx3040=86;89 (RTX 30/40, ~2/9 nvcc work) | rtx203040=+75 (RTX 20/GTX 16)
-  # gtx10plus=+61 (GTX 10xx) | legacy=+52 (GTX 9xx) | wide=trimmed 6-arch
-  # (+datacenter, +Blackwell native) | full=upstream 9-arch (max compat).
-  # Older cards than the preset lose CUDA and fall back to CPU/Vulkan.
   CUDA_ARCHES: '86;89'
-  # Pinned audio.cpp source for reproducible releases: branch, tag, commit
-  # SHA, or '<SHA>~<N>' (the N-th ancestor of a commit). Upstream master is
-  # NOT safe to float on — commit 779714db0872cc7351d69baeaafb8bd5cf47fac7
-  # (2026-09-21) made the exe statically import nvcuda.dll, an NVIDIA-driver
-  # -only DLL, so the binary refused to start on machines without an NVIDIA
-  # GPU. The default below pins to that commit's PARENT (~1) — the last
-  # known-good state. The NO_VMM + /DELAYLOAD mitigations mean newer upstream
-  # commits that only ADD a driver-API import still build and start; validate
-  # a candidate ref with a workflow_dispatch run (audiocpp_ref input — every
-  # run prints 'audio.cpp HEAD: <sha>'), then replace this with that SHA (or
-  # 'HEAD' once upstream loads the driver API dynamically).
+  # Pinned audio.cpp source: branch, tag, commit SHA, or '<SHA>~<N>'. The
+  # 2026-09-21 window around 779714db0872cc7351d69baeaafb8bd5cf47fac7 added
+  # direct CUDA-driver-API calls (cuDeviceGet/cuDeviceGetAttribute) in
+  # attention_fallback.cpp; its CMake linkage and the calls landed in separate
+  # commits, so '~1' links-broken (undefined cuDeviceGet) while the commit
+  # itself links with a static nvcuda.dll import — neither is shippable. The
+  # build steps' pre-flight walks --first-parent back to the nearest ancestor
+  # with NO direct driver-API calls outside ggml and prints
+  # 'audio.cpp HEAD (effective)'. After a green run, replace this with that
+  # literal SHA. Test candidates via the audiocpp_ref dispatch input.
   AUDIOCPP_REF: '779714db0872cc7351d69baeaafb8bd5cf47fac7~1'
 
 jobs:
@@ -113,7 +97,6 @@ jobs:
     name: Windows x64 (CPU+CUDA+Vulkan)
     # Pinned: windows-latest now ships VS18 (MSVC 19.51, VS 2026) which CUDA 12.8's
     # nvcc rejects in host_config.h (fatal C1189, only VS 2017-2022 allowed).
-    # Upstream audio.cpp builds on windows-2022, so stay here.
     runs-on: windows-2022
     if: github.event_name != 'workflow_dispatch' || inputs.windows
     steps:
@@ -144,12 +127,6 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION_WINDOWS }}
           method: 'local'
-          # Installer download is already cached by the action
-          # (use-github-cache/use-local-cache default true). Do NOT add a
-          # manual actions/cache of the install dir (multi-GB, registry + VS
-          # integration don't restore from a file copy). Kept full 'local'
-          # install for correctness; trim via sub-packages only after
-          # validating the exact nvcc/cudart/cublas/cufft component set.
           use-github-cache: 'true'
           use-local-cache: 'true'
 
@@ -164,17 +141,8 @@ jobs:
       - name: Build audio.cpp (CPU+CUDA+Vulkan, distributable)
         shell: pwsh
         run: |
-          # Direct CMake: the helper scripts (build_windows.ps1 presets) force a
-          # single GPU backend, but upstream CMake itself only forbids CUDA+HIP,
-          # so CUDA+Vulkan configure fine together.
-          # CUDA arches: trimmed env.CUDA_ARCHES (6 entries) instead of the
-          # upstream 9-arch portable default — every .cu compiles Nx, so this
-          # is the biggest build-time lever. 90-virtual PTX keeps
-          # forward-compat JIT for newer GPUs; 120a-real covers Blackwell.
-          # -CpuArch avx2 (balance) avoids AVX-512-only instructions that crash
-          # with 0xC000001D on CPUs without AVX-512. 'baseline' is slowest but
-          # runs on the oldest PCs (also disables llamafile SGEMM, like the
-          # upstream 'portable' profile).
+          # Direct CMake: helper scripts force a single GPU backend; upstream
+          # CMake itself only forbids CUDA+HIP, so CUDA+Vulkan configure fine.
           $arch = "${{ inputs.cpu_arch }}"
           if ([string]::IsNullOrEmpty($arch)) { $arch = "avx2" }
           if ($arch -eq "baseline") {
@@ -184,50 +152,68 @@ jobs:
             $isa = @("-DGGML_AVX=ON", "-DGGML_AVX2=ON", "-DGGML_AVX512=OFF", "-DGGML_AVX512_VBMI=OFF", "-DGGML_AVX512_VNNI=OFF", "-DGGML_AVX512_BF16=OFF", "-DGGML_AV_VNNI=ON")
             $llamafile = "ON"
           }
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # depth 30: history headroom for the pre-flight walk-back below.
+          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
-          # Supported refs: branch/tag, plain SHA, or '<SHA>~<N>' (N-th
-          # ancestor — the env default is the parent of the commit that
-          # introduced the static nvcuda.dll import). GitHub cannot resolve
-          # '~' server-side, so fetch enough depth and resolve locally.
+          # Supported refs: branch/tag, plain SHA, or '<SHA>~<N>'. '~' cannot
+          # be resolved server-side, so fetch enough history and resolve
+          # locally.
           $audioRef = "${{ inputs.audiocpp_ref }}"
           if ([string]::IsNullOrEmpty($audioRef)) { $audioRef = "$env:AUDIOCPP_REF" }
           if ($audioRef -and $audioRef -ne "HEAD") {
             if ($audioRef -match '^([0-9a-fA-F]{6,40})~(\d+)$') {
               $baseSha = $Matches[1]; $back = [int]$Matches[2]
-              git -C audio-cpp fetch --depth ($back + 2) origin "$baseSha"
+              if ($back -gt 28) { throw "audio.cpp pin '~$back' exceeds the 30-commit fetch depth" }
+              git -C audio-cpp fetch --depth 30 origin "$baseSha"
               $pinSha = "$(git -C audio-cpp rev-parse "$baseSha~$back")"
-              if (-not $pinSha) { throw "could not resolve audio.cpp pin '$audioRef' (is $baseSha reachable upstream?)" }
+              if ([string]::IsNullOrEmpty($pinSha)) { throw "could not resolve audio.cpp pin '$audioRef' (is $baseSha reachable upstream?)" }
               git -C audio-cpp checkout $pinSha
               if ($LASTEXITCODE -ne 0) { throw "git checkout of audio.cpp pin '$pinSha' failed" }
             } else {
-              git -C audio-cpp fetch --depth 1 origin "$audioRef"
+              git -C audio-cpp fetch --depth 30 origin "$audioRef"
               git -C audio-cpp checkout FETCH_HEAD
             }
           }
           $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
           "audio.cpp ref: $audioRef"
           "audio.cpp HEAD: $audioHead"
+          # ---- Pre-flight: never build a state that calls the CUDA driver API ----
+          # attention_fallback.cpp (engine_runtime) calls cuDeviceGet /
+          # cuDeviceGetAttribute. Those symbols come ONLY from the driver
+          # import lib (nvcuda.lib / libcuda.so stub): Windows could delay-load
+          # it, but on Linux a linked driver lib is a DT_NEEDED that refuses to
+          # start on driverless machines. The only shippable state is one with
+          # no direct cuXxx calls outside ggml (ggml's VMM path is off via
+          # GGML_CUDA_NO_VMM=ON). Upstream's calls and their CMake linkage
+          # landed in separate commits, so pins can land on unbuildable
+          # intermediates — walk --first-parent back to the last ancestor
+          # without them. git grep only; ~seconds. The regex requires '('
+          # right after the symbol, so dlsym-style strings ("cuDeviceGet")
+          # and cublas*/cudart* names (lowercase after 'cu') do NOT match.
+          $apiRe = '(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
+          $gspec = @('--', '*.cpp', '*.cc', '*.c', '*.h', '*.hpp', '*.cu', '*.cuh',
+                     ':(exclude)ggml', ':(exclude)external', ':(exclude)third_party',
+                     ':(exclude)examples', ':(exclude)tests')
+          $cleanSha = $null
+          foreach ($sha in @(git -C audio-cpp rev-list --first-parent -n 30 HEAD)) {
+            $hits = @(git -C audio-cpp grep -E "$apiRe" "$sha" @gspec 2>$null)
+            if ($hits.Count -eq 0) { $cleanSha = $sha; break }
+            "  pre-flight: $sha calls the CUDA driver API directly (e.g. $($hits[0])) — not shippable; stepping back"
+          }
+          if (-not $cleanSha) {
+            throw "no audio.cpp ancestor within 30 commits of $audioHead is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF (see 'audio.cpp HEAD:' in the last green run)"
+          }
+          if ($cleanSha -ne "$(git -C audio-cpp rev-parse HEAD)") {
+            git -C audio-cpp checkout $cleanSha
+            if ($LASTEXITCODE -ne 0) { throw "git checkout of pre-flight ancestor $cleanSha failed" }
+            "::warning::audio.cpp $audioHead calls the CUDA driver API directly (upstream link-break / driver-only import); building last clean ancestor $cleanSha instead. Set AUDIOCPP_REF to that SHA for reproducible releases."
+          }
+          $audioHead = "$(git -C audio-cpp rev-parse HEAD)"
+          "audio.cpp HEAD (effective): $audioHead"
           # NOTE: do not put '#' comment lines inside the backtick-continued
-          # cmake call below. PowerShell ends the statement at the comment, so
-          # the next '-D...' line then runs as its own command and fails with
-          # "The term '-DCUDAToolkit_ROOT=...' is not recognized".
-          # Keep this cmake invocation comment-free.
-          # VS compat: runner is pinned to windows-2022 (VS17/VS 2022, supported
-          # by CUDA 12.8). NVCC_PREPEND_OPTIONS is the documented env var and
-          # applies to every nvcc invocation, including CMake's CUDA compiler-id
-          # check (CMakeCUDACompilerId.cu); NVCC_PREPEND_FLAGS is kept as an
-          # alias some tooling reads. Belt-and-braces for a VS18 host move.
+          # cmake call below. Keep this cmake invocation comment-free.
           $env:NVCC_PREPEND_OPTIONS = "-allow-unsupported-compiler"
           $env:NVCC_PREPEND_FLAGS = "-allow-unsupported-compiler"
-          # Semicolons must stay quoted — bare ';' is a PowerShell statement separator.
-          # Named presets from the cuda_arch picker; 'full' omits the flag and
-          # lets upstream use its 9-arch default. default{} keeps raw arch
-          # lists working (env default + forward compat).
-          # NOTE: 'wide' contains 120a-real, which needs a CMake that knows
-          # Blackwell (>= 4.1); the runner image's own CMake is recent enough.
-          # If configure ever rejects it, drop 120a-real — the 90-virtual PTX
-          # still JIT-runs on Blackwell.
           $cudaPreset = "${{ inputs.cuda_arch }}"
           if ([string]::IsNullOrEmpty($cudaPreset)) { $cudaPreset = $env:CUDA_ARCHES }
           $cudaArches = switch ($cudaPreset) {
@@ -267,11 +253,9 @@ jobs:
           $cli = Get-ChildItem -Recurse -Path build/windows-all-release -Filter audiocpp_cli.exe | Select-Object -First 1
           if (-not $cli) { throw "audiocpp_cli.exe not found after build" }
           Copy-Item $cli.FullName bin\audiocpp_cli.exe
-          # Any backend DLLs produced by the build (shared-backend layout).
           Get-ChildItem -Path (Split-Path $cli.FullName -Parent) -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName bin\ -Force }
           # CUDA runtime DLLs (always dynamic) from the toolkit. nvjitlink is
-          # required by cuBLAS/cuFFT in CUDA 12.x — forgetting it is the
-          # classic "missing nvJitLink_120_0.dll" failure on clean machines.
+          # required by cuBLAS/cuFFT in CUDA 12.x.
           foreach ($d in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\bin\x64", "$env:CUDA_PATH\lib")) {
             if (Test-Path $d) {
               foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll", "nvjitlink*.dll")) {
@@ -296,20 +280,9 @@ jobs:
             }
           }
           # ---- Resolve the exe's full static-import closure and bundle it ----
-          # Walk the import graph (exe -> DLLs -> their DLLs) with dumpbin,
-          # resolve every import against the real loader search order PLUS
-          # the build tree and the Vulkan SDK, copy every non-system hit into
-          # bin\, and NAME anything unresolvable instead of failing with a
-          # bare NTSTATUS. Special classes (see file header):
-          #   * api-ms-win-* / ext-ms-win-*: OS-resolved API-set contracts —
-          #     skipped entirely. (MSVC's Llvm\bin contains real stub FILES
-          #     for some of them; bundling those into the zip would be wrong.)
-          #   * nvcuda.dll / nvml.dll / nvapi64.dll: NVIDIA-driver-only DLLs —
-          #     never bundled; a STATIC import hard-fails by name with the
-          #     offending audio.cpp HEAD. Delay-loaded driver DLLs are fine
-          #     and only note their absence — and because this build passes
-          #     /DELAYLOAD:nvcuda.dll, the exe's own nvcuda import lands in
-          #     the delay table, not the static one.
+          # (delay-loaded driver DLLs are fine and only noted; STATIC ones
+          # hard-fail by name — see file header. With the pre-flight above and
+          # /DELAYLOAD in place, nvcuda should never appear statically.)
           $binDir = "$PWD\bin"
           if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
             $searchDirs = @($binDir, "$env:SystemRoot\System32", "$env:SystemRoot")
@@ -368,41 +341,31 @@ jobs:
             if ($driverMissing.Count -gt 0) {
               throw ("audio.cpp HEAD $audioHead statically imports NVIDIA driver DLL(s): $($driverMissing -join ', '). " +
                      "These ship ONLY with the NVIDIA display driver — the exe would refuse to start on every machine " +
-                     "without an NVIDIA GPU (this runner and all CPU/Vulkan-only users). Upstream must load the driver " +
-                     "API dynamically (LoadLibrary/delay-load), or pin AUDIOCPP_REF / the audiocpp_ref dispatch input " +
-                     "to the last commit before this change.")
+                     "without an NVIDIA GPU. Upstream must load the driver API dynamically (LoadLibrary/delay-load), " +
+                     "or pin AUDIOCPP_REF to the last commit before this change.")
             }
             if ($missing.Count -gt 0) {
               throw ("Unresolvable DLL import(s): $($missing -join ', ') — not in bin\, the build tree, System32 or PATH. " +
-                     "If this is a third-party DLL (cuDNN / codec / ...), audio.cpp must vendor it or load it dynamically " +
-                     "(upstream issue), or pin AUDIOCPP_REF to the last green audio.cpp commit.")
+                     "If this is a third-party DLL, audio.cpp must vendor it or load it dynamically, or pin AUDIOCPP_REF.")
             }
           } else {
             "dumpbin not on PATH; skipping import-closure resolution (smoke test still runs)"
           }
-          # The Vulkan loader ships with GPU drivers but NOT on every Windows
-          # machine — bundle the redistributable loader so CPU-only machines
-          # can still start the app (ggml-vulkan imports vulkan-1.dll).
+          # Bundle the redistributable Vulkan loader (ggml-vulkan imports it).
           if (-not (Test-Path -LiteralPath "$binDir\vulkan-1.dll")) {
             if (Test-Path -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll") {
               Copy-Item -LiteralPath "$env:SystemRoot\System32\vulkan-1.dll" -Destination $binDir -Force
               "  bundled  vulkan-1.dll <- System32"
             }
           }
-          # App-local VC runtime + OpenMP fallback: the vswhere redist lookup
-          # finds nothing on this runner image, and System32 holds the
-          # redist-installed copies of exactly these redistributable DLLs.
+          # App-local VC runtime + OpenMP fallback from System32.
           foreach ($rt in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll", "msvcp140_atomic_wait.dll", "vcomp140.dll")) {
             $src = "$env:SystemRoot\System32\$rt"
             if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath "$binDir\$rt")) {
               Copy-Item -LiteralPath $src -Destination $binDir -Force
             }
           }
-          # Hard-fail if CUDA silently did not make it into the build (renamed
-          # upstream flag, failed toolkit detection, ...). A CUDA-enabled build
-          # either imports the CUDA runtime DLLs in the exe, produces a shared
-          # ggml-cuda backend DLL, or shows GGML_CUDA=ON in the cache — so this
-          # can never ship a CPU/Vulkan-only zip by accident.
+          # Hard-fail if CUDA silently did not make it into the build.
           $cudaLinked = $false
           if (Get-ChildItem -Recurse -Path build/windows-all-release -Filter "*cuda*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1) { $cudaLinked = $true }
           if (Select-String -Path build/windows-all-release/CMakeCache.txt -Pattern "^GGML_CUDA:BOOL=ON$" -Quiet) { $cudaLinked = $true }
@@ -411,16 +374,9 @@ jobs:
           }
           if (-not $cudaLinked) { throw "CUDA backend was not linked into the build" }
           Get-ChildItem bin
-          # Smoke test (informational: no GPU on the runner). What must hold:
-          # the exe STARTS and every DLL import resolves. Packaging breakage
-          # shows up as NTSTATUS exit codes — NEGATIVE in $LASTEXITCODE
-          # (e.g. 0xC0000135 'DLL not found' = -1073741515, 0xC000001D
-          # 'illegal instruction'). A plain exit 1 from --list-devices is an
-          # app-level "nothing to list without a GPU" result and is tolerated,
-          # mirroring the Linux job. CUDA presence is already proven by the
-          # linkage assertion above. NOTE: the trailing 'exit 0' matters —
-          # GitHub's pwsh shell propagates $LASTEXITCODE of the last native
-          # command as the step result.
+          # Smoke test (informational: no GPU on the runner). Negative
+          # $LASTEXITCODE = NTSTATUS loader failure; plain non-zero = app-level
+          # result, tolerated. Trailing 'exit 0' matters for step result.
           & .\bin\audiocpp_cli.exe --list-devices
           $smoke = $LASTEXITCODE
           "audiocpp_cli --list-devices exit code: $smoke"
@@ -456,8 +412,6 @@ jobs:
           $addBin += "--add-binary"; $addBin += "bin/audiocpp_cli.exe;bin"
           Get-ChildItem -Path bin -Filter *.dll | ForEach-Object { $addBin += "--add-binary"; $addBin += "bin/$($_.Name);bin" }
           pyinstaller --noconfirm --onedir --windowed --name "Yue2Studio" @addBin --collect-all customtkinter app/main.py
-          # 7z is preinstalled on windows-2022 and multithreaded; Compress-Archive
-          # is single-threaded and ~5-10 min on a PyInstaller onedir tree.
           7z a -tzip -mx=3 Yue2Studio-Windows-x64.zip ./dist/Yue2Studio/*
 
       - name: Upload build artifacts (Windows)
@@ -469,7 +423,6 @@ jobs:
   # ================= Linux: CPU + CUDA + Vulkan =================
   linux:
     name: Linux x64 (CPU+CUDA+Vulkan)
-    # 24.04 ships gcc-13 natively: no toolchain PPA + apt refresh on every run.
     runs-on: ubuntu-24.04
     if: github.event_name != 'workflow_dispatch' || inputs.linux
     steps:
@@ -494,8 +447,6 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
-          # gcc-13 is audio.cpp's minimum and nvcc 12.8's supported host compiler
-          # (pinned via CUDAHOSTCXX below). Native on 24.04 — no PPA needed.
           if ! command -v gcc-13 >/dev/null 2>&1; then
             sudo apt-get install -y -qq gcc-13 g++-13
           fi
@@ -507,9 +458,6 @@ jobs:
         with:
           cuda: ${{ env.CUDA_VERSION_LINUX }}
           method: 'network'
-          # Installer download is already cached by the action
-          # (use-github-cache/use-local-cache default true); the remaining
-          # cost is install + compile, addressed below via trimmed arches.
           use-github-cache: 'true'
           use-local-cache: 'true'
 
@@ -517,9 +465,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          # Fresh VMs start at 0% hits without this — the launcher flags below
-          # only pay off across runs. Exact-key miss + prefix restore is the
-          # intended pattern: each run saves a new entry, restores the latest.
           key: ccache-linux-cuda${{ env.CUDA_VERSION_LINUX }}-gcc13-${{ hashFiles('.github/workflows/build-release.yml') }}-${{ github.sha }}
           restore-keys: |
             ccache-linux-cuda${{ env.CUDA_VERSION_LINUX }}-gcc13-${{ hashFiles('.github/workflows/build-release.yml') }}-
@@ -529,17 +474,6 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Direct CMake for the same reason as Windows: helper scripts allow
-          # only one GPU backend, upstream CMake allows CUDA+Vulkan together.
-          # --native-cpu OFF equivalent = portable kernels (no -march=native →
-          # no AVX-512-only binary that dies with SIGILL on older CPUs).
-          # CUDA coverage presets from the cuda_arch picker (default '86;89'):
-          # each .cu compiles Nx. 'full' omits the flag and restores the
-          # 9-arch portable default. The *) branch keeps raw arch lists working.
-          # NOTE: 'wide' contains 120a-real, which needs a CMake that knows
-          # Blackwell (>= 4.1). The runner image's own CMake (in /usr/local/bin,
-          # ahead of apt's 3.28) is recent enough; if configure ever rejects it,
-          # drop 120a-real — the 90-virtual PTX still JIT-runs on Blackwell.
           CUDA_PRESET="${{ inputs.cuda_arch }}"
           if [ -z "$CUDA_PRESET" ]; then CUDA_PRESET="$CUDA_ARCHES"; fi
           case "$CUDA_PRESET" in
@@ -551,32 +485,57 @@ jobs:
             "full") CUDA_ARCHES="full" ;;
             *) CUDA_ARCHES="$CUDA_PRESET" ;;
           esac
-          # Array (not a plain string): ';' must never be unquoted in bash,
-          # and a quoted-empty string would reach cmake as a bogus empty arg.
           CUDA_ARCH_ARGS=()
           if [ -n "$CUDA_ARCHES" ] && [ "$CUDA_ARCHES" != "full" ]; then CUDA_ARCH_ARGS=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHES"); fi
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
+          # depth 30: history headroom for the pre-flight walk-back below.
+          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
           # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
-          # '<SHA>~<N>' (N-th ancestor) is resolved locally with enough depth.
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
             if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
               BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
-              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
+              if [ "$BACK" -gt 28 ]; then echo "::error::pin '~${BACK}' exceeds the 30-commit fetch depth"; exit 1; fi
+              git -C audio-cpp fetch --depth 30 origin "$BASE_SHA"
               PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
               git -C audio-cpp checkout "$PIN_SHA"
             else
-              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
+              git -C audio-cpp fetch --depth 30 origin "${AUDIO_REF}"
               git -C audio-cpp checkout FETCH_HEAD
             fi
           fi
+          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
           echo "audio.cpp ref: ${AUDIO_REF}"
-          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          echo "audio.cpp HEAD: ${AUDIO_HEAD}"
+          # ---- Pre-flight: never build a state that calls the CUDA driver API ----
+          # (rationale in the Windows job: cuDeviceGet & co. resolve only
+          # against the NVIDIA driver import lib; ELF has no delay-load, so a
+          # linked libcuda.so.1 is a startup-failing DT_NEEDED on driverless
+          # machines. Walk --first-parent to the last ancestor whose own code
+          # has no direct cuXxx calls outside ggml. git grep only, ~seconds.)
+          API_RE='(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
+          GSPEC=(-- '*.cpp' '*.cc' '*.c' '*.h' '*.hpp' '*.cu' '*.cuh'
+                 ':(exclude)ggml' ':(exclude)external' ':(exclude)third_party'
+                 ':(exclude)examples' ':(exclude)tests')
+          CLEAN_SHA=""
+          for sha in $(git -C audio-cpp rev-list --first-parent -n 30 HEAD); do
+            HITS="$(git -C audio-cpp grep -E "$API_RE" "$sha" "${GSPEC[@]}" 2>/dev/null || true)"
+            if [ -z "$HITS" ]; then CLEAN_SHA="$sha"; break; fi
+            echo "  pre-flight: $sha calls the CUDA driver API directly — not shippable; stepping back"
+          done
+          if [ -z "$CLEAN_SHA" ]; then
+            echo "::error::no audio.cpp ancestor within 30 commits of ${AUDIO_HEAD} is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF"
+            exit 1
+          fi
+          if [ "$CLEAN_SHA" != "$(git -C audio-cpp rev-parse HEAD)" ]; then
+            git -C audio-cpp checkout "$CLEAN_SHA"
+            echo "::warning::audio.cpp ${AUDIO_HEAD} calls the CUDA driver API directly (upstream link-break / driver-only import); building last clean ancestor ${CLEAN_SHA} instead. Set AUDIOCPP_REF to that SHA for reproducible releases."
+          fi
+          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
+          echo "audio.cpp HEAD (effective): ${AUDIO_HEAD}"
           export CC=gcc-13 CXX=g++-13 CUDAHOSTCXX=g++-13
           export CCACHE_DIR="$HOME/.cache/ccache"
           export CCACHE_MAXSIZE="2G"
-          # nvcc embeds time macros; without this ccache never hits on .cu files.
           export CCACHE_SLOPPINESS="time_macros,include_file_mtime,include_file_ctime,pch_defines,file_macro"
           ccache -z || true
           cmake -S audio-cpp -B build/linux-all-release -G Ninja \
@@ -596,16 +555,9 @@ jobs:
           CLI_BIN=$(find build/linux-all-release -type f -name audiocpp_cli | head -n 1)
           if [ -z "$CLI_BIN" ]; then echo "audiocpp_cli not found after build"; exit 1; fi
           cp "$CLI_BIN" bin/
-          # Any shared backend libs produced by the build.
           find "$(dirname "$CLI_BIN")" -maxdepth 1 -name "*.so*" -type f -exec cp {} bin/ \; || true
           ls -la bin
-          # ---- Bundle the CUDA runtime: end users will NOT have a toolkit ----
-          # ggml links cudart/cublas/cublasLt/cufft dynamically (cuBLAS has no
-          # static variant), and cuBLASLt/cuFFT in CUDA 12.x also need
-          # nvJitLink. Without these libs next to the binary the packaged app
-          # cannot use CUDA on a clean machine — and if CUDA is linked
-          # straight into audiocpp_cli it will not even start (missing
-          # DT_NEEDED entry).
+          # ---- Bundle the CUDA runtime (redistributable, unlike the driver) ----
           : "${CUDA_PATH:=/usr/local/cuda}"
           CUDA_LIB_DIRS=("${CUDA_PATH}/lib64" "${CUDA_PATH}/lib" "/usr/local/cuda/lib64")
           for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcufft.so.11 libnvJitLink.so.12; do
@@ -619,27 +571,11 @@ jobs:
               echo "WARNING: $lib not found in the CUDA toolkit — CUDA runtime incomplete"
             fi
           done
-          # Self-contained lookup: CMake bakes absolute build-machine rpaths
-          # (/usr/local/cuda-12.8/lib64) into the binary — useless on user
-          # machines. $ORIGIN makes the CLI, shared ggml backends and the CUDA
-          # runtime resolve each other from their own directory, which is
-          # exactly where PyInstaller puts them (_internal/bin) in every
-          # package format (tar.gz, AppImage, RPM).
           patchelf --set-rpath '$ORIGIN' bin/audiocpp_cli
           for so in bin/*.so*; do
             if [ -f "$so" ]; then patchelf --set-rpath '$ORIGIN' "$so"; fi
           done
-          # ---- Full shared-library closure check (mirror of the Windows
-          # import-table resolver): ldd names anything the loader cannot
-          # resolve. Missing libs are auto-bundled from the build tree or the
-          # CUDA toolkit when possible; anything still missing is NAMED in
-          # the error instead of failing with an opaque loader message.
-          # Driver-provided libs (libcuda.so.1 / libnvidia-ml.so.1) ship only
-          # with the NVIDIA driver — a static dependency on one is an UPSTREAM
-          # regression (the binary cannot run on driverless machines like this
-          # runner), so they get their own hard-fail. The toolkit's
-          # stubs/libcuda.so is link-only and must never be bundled (-not -path
-          # '*/stubs/*' below).
+          # ---- ldd closure check; driver libs hard-fail by name ----
           DRIVER_LIBS="libcuda.so libcuda.so.1 libnvidia-ml.so.1"
           DRIVER_MISSING=""
           MISSING_LIBS=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
@@ -658,20 +594,17 @@ jobs:
           fi
           if [ -n "$DRIVER_MISSING" ]; then
             echo "::error::audio.cpp statically links NVIDIA driver library(ies):${DRIVER_MISSING}"
-            echo "These ship only with the NVIDIA driver — the binary cannot run on machines without one (like this runner)."
-            echo "Fix upstream (dlopen the driver library) or pin AUDIOCPP_REF / the audiocpp_ref dispatch input to the last green commit."
+            echo "These ship only with the NVIDIA driver — the binary cannot run on machines without one."
+            echo "Fix upstream (dlopen the driver library) or pin AUDIOCPP_REF to the last green commit."
             exit 1
           fi
           STILL_MISSING=$(ldd bin/audiocpp_cli 2>/dev/null | grep 'not found' | awk '{print $1}' | sort -u || true)
           if [ -n "$STILL_MISSING" ]; then
             echo "::error::unresolved shared-library dependencies: ${STILL_MISSING}"
-            echo "Not in the build tree or CUDA toolkit — audio.cpp must vendor it, or pin AUDIOCPP_REF to the last green commit."
+            echo "Not in the build tree or CUDA toolkit — audio.cpp must vendor it, or pin AUDIOCPP_REF."
             exit 1
           fi
-          # Hard-fail if CUDA silently did not make it into the build (renamed
-          # upstream flag, failed toolkit detection, ...). Signals: the exe
-          # links the CUDA runtime, a shared ggml-cuda backend exists, or
-          # ggml's cache says GGML_CUDA=ON. Any one is sufficient proof.
+          # Hard-fail if CUDA silently did not make it into the build.
           CUDA_LINKED=0
           if ldd bin/audiocpp_cli | grep -Eq 'libcublas|libcudart|libcufft'; then CUDA_LINKED=1; fi
           if find build/linux-all-release -type f -name '*cuda*.so*' | grep -q .; then CUDA_LINKED=1; fi
@@ -681,11 +614,7 @@ jobs:
             exit 1
           fi
           ls -la bin
-          # Smoke test (informational: no GPU on the runner). A non-zero
-          # --list-devices exit is an app-level result (nothing to list
-          # without a GPU) and is tolerated — but loader errors (127) and
-          # signal deaths (>=128, e.g. SIGILL 132 / SIGSEGV 139) mean the
-          # binary itself is broken and must fail the build.
+          # Smoke test (informational: no GPU on the runner).
           rc=0
           ./bin/audiocpp_cli --list-devices || rc=$?
           echo "audiocpp_cli --list-devices exit code: $rc"
@@ -712,8 +641,6 @@ jobs:
         run: |
           set -euxo pipefail
           BIN_ARGS=(--add-binary "bin/audiocpp_cli:bin")
-          # 'if' form on purpose: '[ -f ] && cmd' as the last loop statement
-          # aborts the whole step under 'set -e' when the glob matches nothing.
           for so in bin/*.so*; do
             if [ -f "$so" ]; then BIN_ARGS+=(--add-binary "$so:bin"); fi
           done
@@ -791,24 +718,47 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          git clone --depth 1 https://github.com/0xShug0/audio.cpp.git audio-cpp
-          # Pin: dispatch input wins over env.AUDIOCPP_REF; 'HEAD' floats.
-          # '<SHA>~<N>' (N-th ancestor) is resolved locally with enough depth.
+          # Same pin + pre-flight as the other OS jobs so all three artifacts
+          # ship the SAME audio.cpp source state.
+          git clone --depth 30 https://github.com/0xShug0/audio.cpp.git audio-cpp
           AUDIO_REF="${{ inputs.audiocpp_ref }}"
           if [ -z "$AUDIO_REF" ]; then AUDIO_REF="${AUDIOCPP_REF:-HEAD}"; fi
           if [ -n "$AUDIO_REF" ] && [ "$AUDIO_REF" != "HEAD" ]; then
             if [[ "$AUDIO_REF" =~ ^([0-9a-fA-F]{6,40})~([0-9]+)$ ]]; then
               BASE_SHA="${BASH_REMATCH[1]}"; BACK="${BASH_REMATCH[2]}"
-              git -C audio-cpp fetch --depth "$((BACK + 2))" origin "$BASE_SHA"
+              if [ "$BACK" -gt 28 ]; then echo "::error::pin '~${BACK}' exceeds the 30-commit fetch depth"; exit 1; fi
+              git -C audio-cpp fetch --depth 30 origin "$BASE_SHA"
               PIN_SHA="$(git -C audio-cpp rev-parse "${BASE_SHA}~${BACK}")"
               git -C audio-cpp checkout "$PIN_SHA"
             else
-              git -C audio-cpp fetch --depth 1 origin "${AUDIO_REF}"
+              git -C audio-cpp fetch --depth 30 origin "${AUDIO_REF}"
               git -C audio-cpp checkout FETCH_HEAD
             fi
           fi
+          AUDIO_HEAD="$(git -C audio-cpp rev-parse HEAD)"
           echo "audio.cpp ref: ${AUDIO_REF}"
-          echo "audio.cpp HEAD: $(git -C audio-cpp rev-parse HEAD)"
+          echo "audio.cpp HEAD: ${AUDIO_HEAD}"
+          # Pre-flight (same rule as Windows/Linux — keeps the three OS
+          # artifacts on one upstream SHA even though Metal never links CUDA).
+          API_RE='(^|[^A-Za-z0-9_])cu[A-Z][A-Za-z0-9_]*[[:space:]]*\('
+          GSPEC=(-- '*.cpp' '*.cc' '*.c' '*.h' '*.hpp' '*.cu' '*.cuh'
+                 ':(exclude)ggml' ':(exclude)external' ':(exclude)third_party'
+                 ':(exclude)examples' ':(exclude)tests')
+          CLEAN_SHA=""
+          for sha in $(git -C audio-cpp rev-list --first-parent -n 30 HEAD); do
+            HITS="$(git -C audio-cpp grep -E "$API_RE" "$sha" "${GSPEC[@]}" 2>/dev/null || true)"
+            if [ -z "$HITS" ]; then CLEAN_SHA="$sha"; break; fi
+            echo "  pre-flight: $sha calls the CUDA driver API directly — stepping back for cross-OS pin consistency"
+          done
+          if [ -z "$CLEAN_SHA" ]; then
+            echo "::error::no audio.cpp ancestor within 30 commits of ${AUDIO_HEAD} is free of direct CUDA driver-API calls — pin a known-green AUDIOCPP_REF"
+            exit 1
+          fi
+          if [ "$CLEAN_SHA" != "$(git -C audio-cpp rev-parse HEAD)" ]; then
+            git -C audio-cpp checkout "$CLEAN_SHA"
+            echo "::warning::audio.cpp ${AUDIO_HEAD} calls the CUDA driver API directly; building last clean ancestor ${CLEAN_SHA} for cross-OS pin consistency."
+          fi
+          echo "audio.cpp HEAD (effective): $(git -C audio-cpp rev-parse HEAD)"
           cd audio-cpp
           ./scripts/build_metal.sh --native-cpu OFF --model-set custom --models yue2 --target audiocpp_cli
           mkdir -p ../bin
@@ -846,8 +796,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [windows, linux, macos]
-    # Not 'always()': a failed/cancelled OS build must NOT publish a partial
-    # release. 'skipped' jobs (dispatch toggles) are fine.
+    # Not 'always()': a failed OS build must NOT publish a partial release.
     if: >-
       ${{ !cancelled()
           && needs.windows.result != 'failure'
